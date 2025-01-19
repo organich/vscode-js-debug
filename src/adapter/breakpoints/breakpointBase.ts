@@ -4,10 +4,11 @@
 
 import Cdp from '../../cdp/api';
 import { LogTag } from '../../common/logging';
-import { absolutePathToFileUrl, urlToRegex } from '../../common/urlUtils';
+import { IPosition } from '../../common/positions';
+import { absolutePathToFileUrl } from '../../common/urlUtils';
 import Dap from '../../dap/api';
 import { BreakpointManager } from '../breakpoints';
-import { base1To0, IUiLocation, Source, SourceFromMap, uiToRawOffset } from '../sources';
+import { base1To0, ISourceScript, IUiLocation, SourceFromMap } from '../source';
 import { Script, Thread } from '../threads';
 
 export type LineColumn = { lineNumber: number; columnNumber: number }; // 1-based
@@ -37,7 +38,8 @@ const isSetByLocation = (
 ): params is Cdp.Debugger.SetBreakpointParams => 'location' in params;
 
 const breakpointIsForUrl = (params: Cdp.Debugger.SetBreakpointByUrlParams, url: string) =>
-  (params.url && url === params.url) || (params.urlRegex && new RegExp(params.urlRegex).test(url));
+  (params.url && url === params.url)
+  || (params.urlRegex && new RegExp(params.urlRegex).test(url));
 
 /**
  * We're currently working on sending the breakpoint to CDP.
@@ -140,20 +142,18 @@ export abstract class Breakpoint {
    * the breakpoints when we pretty print a source. This is dangerous with
    * sharp edges, use with caution.
    */
-  public async updateSourceLocation(source: Dap.Source, uiLocation: IUiLocation) {
+  public async updateSourceLocation(thread: Thread, source: Dap.Source, uiLocation: IUiLocation) {
     this._source = source;
     this._originalPosition = uiLocation;
 
-    this.updateCdpRefs(list =>
-      list.map(bp =>
-        bp.state === CdpReferenceState.Applied
-          ? {
-              ...bp,
-              uiLocations: this._manager._sourceContainer.currentSiblingUiLocations(uiLocation),
-            }
-          : bp,
-      ),
-    );
+    const todo: Promise<unknown>[] = [];
+    for (const ref of this.cdpBreakpoints) {
+      if (ref.state === CdpReferenceState.Applied) {
+        todo.push(this.updateUiLocations(thread, ref.cdpId, ref.locations));
+      }
+    }
+
+    await Promise.all(todo);
   }
 
   /**
@@ -187,7 +187,10 @@ export abstract class Breakpoint {
         // a source map source. To make them work, we always set by url to not miss compiled.
         // Additionally, if we have two sources with the same url, but different path (or no path),
         // this will make breakpoint work in all of them.
-        this._setByPath(thread, uiToRawOffset(this.originalPosition, source?.runtimeScriptOffset)),
+        this._setByPath(
+          thread,
+          source?.offsetSourceToScript(this.originalPosition) || this.originalPosition,
+        ),
       );
     }
 
@@ -195,7 +198,7 @@ export abstract class Breakpoint {
 
     // double check still enabled to avoid racing
     if (source && this.isEnabled) {
-      const uiLocations = this._manager._sourceContainer.currentSiblingUiLocations({
+      const uiLocations = await this._manager._sourceContainer.currentSiblingUiLocations({
         lineNumber: this.originalPosition.lineNumber,
         columnNumber: this.originalPosition.columnNumber,
         source,
@@ -203,7 +206,7 @@ export abstract class Breakpoint {
 
       await Promise.all(
         uiLocations.map(uiLocation =>
-          this._setByUiLocation(thread, uiToRawOffset(uiLocation, source.runtimeScriptOffset)),
+          this._setByUiLocation(thread, source.offsetSourceToScript(uiLocation))
         ),
       );
     }
@@ -240,8 +243,9 @@ export abstract class Breakpoint {
       return;
     }
 
+    const locations = await this._manager._sourceContainer.currentSiblingUiLocations(uiLocation);
+
     this.updateExistingCdpRef(cdpId, bp => {
-      const locations = this._manager._sourceContainer.currentSiblingUiLocations(uiLocation);
       const inPreferredSource = locations.filter(l => l.source === source);
       return {
         ...bp,
@@ -275,19 +279,28 @@ export abstract class Breakpoint {
 
     this.isEnabled = false;
     const promises: Promise<unknown>[] = this.cdpBreakpoints.map(bp =>
-      this.removeCdpBreakpoint(bp),
+      this.removeCdpBreakpoint(bp)
     );
     await Promise.all(promises);
   }
 
-  public async updateForSourceMap(thread: Thread, script: Script) {
+  /**
+   * Updates breakpoint placements in the debugee in responce to a new script
+   * getting parsed. This is useful in two cases:
+   *
+   * 1. Where the source was sourcemapped, in which case a new sourcemap tells
+   *    us scripts to set BPs in.
+   * 2. Where a source was set by script ID, which happens for sourceReferenced
+   *    sources.
+   */
+  public async updateForNewLocations(thread: Thread, script: Script) {
     const source = this._manager._sourceContainer.source(this.source);
     if (!source) {
       return [];
     }
 
     // Find all locations for this breakpoint in the new script.
-    const uiLocations = this._manager._sourceContainer.currentSiblingUiLocations(
+    const uiLocations = await this._manager._sourceContainer.currentSiblingUiLocations(
       {
         lineNumber: this.originalPosition.lineNumber,
         columnNumber: this.originalPosition.columnNumber,
@@ -303,7 +316,7 @@ export abstract class Breakpoint {
     const promises: Promise<void>[] = [];
     for (const uiLocation of uiLocations) {
       promises.push(
-        this._setByScriptId(thread, script, uiToRawOffset(uiLocation, source.runtimeScriptOffset)),
+        this._setForSpecific(thread, script, source.offsetSourceToScript(uiLocation)),
       );
     }
 
@@ -315,7 +328,7 @@ export abstract class Breakpoint {
         continue;
       }
 
-      if (!this.breakpointIsForSource(bp.args, source)) {
+      if (!breakpointIsForUrl(bp.args, script.url)) {
         continue;
       }
 
@@ -354,23 +367,21 @@ export abstract class Breakpoint {
   }
 
   /**
-   * Gets whether the breakpoint was set in the source by URL. Also checks
-   * the rebased remote paths, since Sources are always normalized to the
-   * 'local' locations, but the CDP set is for the remote.
+   * Gets whether this breakpoint has resolved to the given position.
    */
-  private breakpointIsForSource(args: Cdp.Debugger.SetBreakpointByUrlParams, source: Source) {
-    if (breakpointIsForUrl(args, source.url)) {
-      return true;
-    }
+  public hasResolvedAt(scriptId: string, position: IPosition) {
+    const { lineNumber, columnNumber } = position.base0;
 
-    const remotePath = this._manager._sourceContainer.sourcePathResolver.rebaseLocalToRemote(
-      source.absolutePath,
+    return this.cdpBreakpoints.some(
+      bp =>
+        bp.state === CdpReferenceState.Applied
+        && bp.locations.some(
+          l =>
+            l.scriptId === scriptId
+            && l.lineNumber === lineNumber
+            && (l.columnNumber === undefined || l.columnNumber === columnNumber),
+        ),
     );
-    if (breakpointIsForUrl(args, remotePath)) {
-      return true;
-    }
-
-    return false;
   }
 
   /**
@@ -389,8 +400,8 @@ export abstract class Breakpoint {
   ) {
     this.updateCdpRefs(list =>
       list.map(bp =>
-        bp.state !== CdpReferenceState.Applied || bp.cdpId !== cdpId ? bp : mutator(bp),
-      ),
+        bp.state !== CdpReferenceState.Applied || bp.cdpId !== cdpId ? bp : mutator(bp)
+      )
     );
   }
 
@@ -451,10 +462,9 @@ export abstract class Breakpoint {
   }
 
   private async _setByUiLocation(thread: Thread, uiLocation: IUiLocation): Promise<void> {
-    const promises: Promise<void>[] = [];
-    const scripts = thread.scriptsFromSource(uiLocation.source);
-    for (const script of scripts) promises.push(this._setByScriptId(thread, script, uiLocation));
-    await Promise.all(promises);
+    await Promise.all(
+      uiLocation.source.scripts.map(script => this._setForSpecific(thread, script, uiLocation)),
+    );
   }
 
   protected async _setByPath(thread: Thread, lineColumn: LineColumn): Promise<void> {
@@ -473,8 +483,8 @@ export abstract class Breakpoint {
     }
 
     if (this.source.path) {
-      const urlRegexp =
-        await this._manager._sourceContainer.sourcePathResolver.absolutePathToUrlRegexp(
+      const urlRegexp = await this._manager._sourceContainer.sourcePathResolver
+        .absolutePathToUrlRegexp(
           this.source.path,
         );
       if (!urlRegexp) {
@@ -503,17 +513,20 @@ export abstract class Breakpoint {
    * requests to avoid triggering any logpoint breakpoints multiple times,
    * as would happen if we set a breakpoint both by script and URL.
    */
-  protected hasSetOnLocation(script: Partial<Script>, lineColumn: LineColumn) {
+  protected hasSetOnLocation(script: ISourceScript, lineColumn: LineColumn) {
     return this.cdpBreakpoints.find(
       bp =>
-        (script.scriptId &&
-          isSetByLocation(bp.args) &&
-          bp.args.location.scriptId === script.scriptId &&
-          lcEqual(bp.args.location, lineColumn)) ||
-        (script.url &&
-          isSetByUrl(bp.args) &&
-          new RegExp(bp.args.urlRegex ?? '').test(script.url) &&
-          lcEqual(bp.args, lineColumn)),
+        (script.scriptId
+          && isSetByLocation(bp.args)
+          && bp.args.location.scriptId === script.scriptId
+          && lcEqual(bp.args.location, lineColumn))
+        || (script.url
+          && !script.hasSourceURL
+          && isSetByUrl(bp.args)
+          && (bp.args.urlRegex
+            ? new RegExp(bp.args.urlRegex).test(script.url)
+            : script.url === bp.args.url)
+          && lcEqual(bp.args, lineColumn)),
     );
   }
 
@@ -522,23 +535,65 @@ export abstract class Breakpoint {
    * at the provided script by url regexp already. This is used to deduplicate breakpoint
    * requests to avoid triggering any logpoint breakpoints multiple times.
    */
-  protected hasSetOnLocationByRegexp(urlRegexp: string, lineColumn: LineColumn) {
+  protected hasSetOnLocationByUrl(kind: 're' | 'url', input: string, lineColumn: LineColumn) {
     return this.cdpBreakpoints.find(bp => {
       if (isSetByUrl(bp.args)) {
-        return bp.args.urlRegex === urlRegexp && lcEqual(bp.args, lineColumn);
+        if (!lcEqual(bp.args, lineColumn)) {
+          return false;
+        }
+
+        if (kind === 'url') {
+          return bp.args.urlRegex
+            ? new RegExp(bp.args.urlRegex).test(input)
+            : bp.args.url === input;
+        } else {
+          return kind === 're' && bp.args.urlRegex === input;
+        }
       }
 
       const script = this._manager._sourceContainer.getScriptById(bp.args.location.scriptId);
       if (script) {
-        return lcEqual(bp.args.location, lineColumn) && new RegExp(urlRegexp).test(script.url);
+        return lcEqual(bp.args.location, lineColumn) && kind === 're'
+          ? new RegExp(input).test(script.url)
+          : script.url === input;
       }
 
       return undefined;
     });
   }
 
+  protected async _setForSpecific(thread: Thread, script: ISourceScript, lineColumn: LineColumn) {
+    // prefer to set on script URL for non-anonymous scripts, since url breakpoints
+    // will survive and be hit on reload. But don't set if the script has
+    // a source URL, since V8 doesn't resolve these
+    if (
+      script.url
+      && !script.hasSourceURL
+      && (!script.embedderName || script.embedderName === script.url)
+    ) {
+      return this._setByUrl(thread, script.url, lineColumn);
+    } else {
+      return this._setByScriptId(thread, script, lineColumn);
+    }
+  }
+
   protected async _setByUrl(thread: Thread, url: string, lineColumn: LineColumn): Promise<void> {
-    return this._setByUrlRegexp(thread, urlToRegex(url), lineColumn);
+    lineColumn = base1To0(lineColumn);
+
+    const previous = this.hasSetOnLocationByUrl('url', url, lineColumn);
+    if (previous) {
+      if (previous.state === CdpReferenceState.Pending) {
+        await previous.done;
+      }
+
+      return;
+    }
+
+    return this._setAny(thread, {
+      url,
+      condition: this.getBreakCondition(),
+      ...lineColumn,
+    });
   }
 
   protected async _setByUrlRegexp(
@@ -548,7 +603,7 @@ export abstract class Breakpoint {
   ): Promise<void> {
     lineColumn = base1To0(lineColumn);
 
-    const previous = this.hasSetOnLocationByRegexp(urlRegex, lineColumn);
+    const previous = this.hasSetOnLocationByUrl('re', urlRegex, lineColumn);
     if (previous) {
       if (previous.state === CdpReferenceState.Pending) {
         await previous.done;
@@ -566,7 +621,7 @@ export abstract class Breakpoint {
 
   private async _setByScriptId(
     thread: Thread,
-    script: Script,
+    script: ISourceScript,
     lineColumn: LineColumn,
   ): Promise<void> {
     lineColumn = base1To0(lineColumn);

@@ -2,7 +2,7 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import * as nls from 'vscode-nls';
+import * as l10n from '@vscode/l10n';
 import Cdp from '../../cdp/api';
 import Dap from '../../dap/api';
 import { previewRemoteObject } from '../objectPreview';
@@ -10,19 +10,20 @@ import { previewThis } from '../templates/previewThis';
 import { Thread } from '../threads';
 import { IConsoleMessage } from './consoleMessage';
 
-const localize = nls.loadMessageBundle();
-
 /**
  * Message sent as the result of querying objects on the runtime.
  */
 export class QueryObjectsMessage implements IConsoleMessage {
-  constructor(private readonly protoObj: Cdp.Runtime.RemoteObject, private readonly cdp: Cdp.Api) {}
+  constructor(
+    private readonly protoObj: Cdp.Runtime.RemoteObject,
+    private readonly cdp: Cdp.Api,
+  ) {}
 
   public async toDap(thread: Thread): Promise<Dap.OutputEventParams> {
     if (!this.protoObj.objectId) {
       return {
         category: 'stderr',
-        output: localize('queryObject.invalidObject', 'Only objects can be queried'),
+        output: l10n.t('Only objects can be queried'),
       };
     }
 
@@ -35,7 +36,7 @@ export class QueryObjectsMessage implements IConsoleMessage {
     if (!response) {
       return {
         category: 'stderr',
-        output: localize('queryObject.couldNotQuery', 'Could not query the provided object'),
+        output: l10n.t('Could not query the provided object'),
       };
     }
 
@@ -51,7 +52,7 @@ export class QueryObjectsMessage implements IConsoleMessage {
     } catch (e) {
       return {
         category: 'stderr',
-        output: localize('queryObject.errorPreview', 'Could generate preview: {0}', e.message),
+        output: l10n.t(e.message),
       };
     }
 

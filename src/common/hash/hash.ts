@@ -2,8 +2,8 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 import { hash, shaHash } from '@c4312/chromehash';
+import { promises as fs } from 'fs';
 import { MessagePort, parentPort } from 'worker_threads';
-import { readFileRaw } from '../fsUtils';
 
 export const enum MessageType {
   HashFile,
@@ -25,20 +25,19 @@ export type HashRequest =
   | { type: MessageType.HashBytes; id: number; data: string | Buffer; mode: HashMode }
   | { type: MessageType.VerifyFile; id: number; file: string; expected: string; checkNode: boolean }
   | {
-      type: MessageType.VerifyBytes;
-      id: number;
-      data: string | Buffer;
-      expected: string;
-      checkNode: boolean;
-    };
+    type: MessageType.VerifyBytes;
+    id: number;
+    data: string | Buffer;
+    expected: string;
+    checkNode: boolean;
+  };
 
 /**
  * Message received in the hash response.
  */
 export type HashResponse<T extends HashRequest> = T extends {
   type: MessageType.HashBytes | MessageType.HashFile;
-}
-  ? { id: number; hash?: string }
+} ? { id: number; hash?: string }
   : { id: number; matches: boolean };
 
 /**
@@ -58,8 +57,8 @@ const nodeSuffix = Buffer.from('\n});');
  * @see https://github.com/electron/electron/blob/9c8cdd63fdba87f8505258b2ce81e1dfc30497fc/lib/renderer/init.ts#L5-L25
  */
 const electronPrefix = Buffer.from(
-  '(function (exports, require, module, __filename, __dirname, process, global, Buffer) { ' +
-    'return function (exports, require, module, __filename, __dirname) { ',
+  '(function (exports, require, module, __filename, __dirname, process, global, Buffer) { '
+    + 'return function (exports, require, module, __filename, __dirname) { ',
 );
 const electronSuffix = Buffer.from(
   '\n}.call(this, exports, require, module, __filename, __dirname); });',
@@ -112,7 +111,7 @@ async function handle(message: HashRequest): Promise<HashResponse<HashRequest>> 
   switch (message.type) {
     case MessageType.HashFile:
       try {
-        const data = await readFileRaw(message.file);
+        const data = await fs.readFile(message.file);
         return {
           id: message.id,
           hash: message.mode === HashMode.Chromehash ? hash(data) : shaHash(data),
@@ -128,8 +127,11 @@ async function handle(message: HashRequest): Promise<HashResponse<HashRequest>> 
       }
     case MessageType.VerifyFile:
       try {
-        const data = await readFileRaw(message.file);
-        return { id: message.id, matches: verifyBytes(data, message.expected, message.checkNode) };
+        const data = await fs.readFile(message.file);
+        return {
+          id: message.id,
+          matches: verifyBytes(data, message.expected, message.checkNode),
+        };
       } catch (e) {
         return { id: message.id, matches: false };
       }

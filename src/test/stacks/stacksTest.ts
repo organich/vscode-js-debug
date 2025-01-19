@@ -2,15 +2,17 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import { expect } from 'chai';
 import { delay } from '../../common/promiseUtil';
 import { Dap } from '../../dap/api';
-import { TestP, testWorkspace } from '../test';
+import { createFileTree } from '../createFileTree';
+import { testFixturesDir, TestP, testWorkspace } from '../test';
 import { itIntegrates, waitForPause } from '../testIntegrationUtils';
 
 describe('stacks', () => {
   async function dumpStackAndContinue(p: TestP, scopes: boolean) {
     const event = await p.dap.once('stopped');
-    await p.logger.logStackTrace(event.threadId!, scopes);
+    await p.logger.logStackTrace(event.threadId!, scopes ? Infinity : 0);
     await p.dap.continue({ threadId: event.threadId! });
   }
 
@@ -124,8 +126,8 @@ describe('stacks', () => {
       }),
     ).toString('base64');
 
-    const emptySourceMap =
-      `//# sourceMappingURL=data:application/json;charset=utf-8;base64,` + emptySourceMapContents;
+    const emptySourceMap = `//# sourceMappingURL=data:application/json;charset=utf-8;base64,`
+      + emptySourceMapContents;
 
     itIntegrates('simple stepping', async ({ r }) => {
       const p = await r.launchUrlAndLoad('index.html');
@@ -250,7 +252,7 @@ describe('stacks', () => {
     async function waitForPausedThenDelayStackTrace(p: TestP, scopes: boolean) {
       const event = await p.dap.once('stopped');
       await delay(200); // need to pause test to let debouncer update scripts
-      await p.logger.logStackTrace(event.threadId!, scopes);
+      await p.logger.logStackTrace(event.threadId!, scopes ? Infinity : 0);
       return event;
     }
 
@@ -303,7 +305,7 @@ describe('stacks', () => {
     });
 
     itIntegrates('toggle authored ts', async ({ r }) => {
-      const p = await r.launchUrlAndLoad('basic.html');
+      const p = await r.launchUrl('basic.html');
       const path = p.workspacePath('web/basic.ts');
       const source: Dap.Source = {
         path: path,
@@ -313,17 +315,78 @@ describe('stacks', () => {
 
       const event = await p.dap.once('stopped');
       await delay(500); // need to pause test to let debouncer update scripts
-      await p.logger.logStackTrace(event.threadId!, false);
+      await p.logger.logStackTrace(event.threadId!);
 
       p.log('----send toggle skipfile status request----');
       await p.dap.toggleSkipFileStatus({ resource: path });
-      await p.logger.logStackTrace(event.threadId!, false);
+      await p.logger.logStackTrace(event.threadId!);
 
       p.log('----send (un)toggle skipfile status request----');
       await p.dap.toggleSkipFileStatus({ resource: path });
-      await p.logger.logStackTrace(event.threadId!, false);
+      await p.logger.logStackTrace(event.threadId!);
 
       p.assertLog();
     });
+
+    itIntegrates('handles special chars in stack (#203408)', async ({ r }) => {
+      createFileTree(testFixturesDir, {
+        'nested/a.js': 'exports.foo = (fn) => fn()',
+        '@nested/a.js': 'exports.foo = (fn) => fn()',
+        'test.js': [
+          'require("./@nested/a.js").foo(() => require("./nested/a.js").foo(() => { debugger }))',
+        ],
+      });
+      const handle = await r.runScript('test.js', {
+        skipFiles: ['**/a.js', '!**/@nested/**'],
+      });
+      handle.load();
+      await waitForPause(handle);
+      handle.assertLog({ substring: true });
+    });
+  });
+
+  itIntegrates('uses custom descriptions in frame names', async ({ r }) => {
+    const p = await r.launchAndLoad('blank');
+    p.cdp.Runtime.evaluate({
+      expression: `
+        class Bar {
+          method2() {
+            debugger;
+          }
+
+          toString() {
+            return 'Custom';
+          }
+        }
+
+        class Foo {
+          method1() {
+            return new Bar().method2();
+          }
+        }
+
+        new Foo().method1();
+      `,
+    });
+
+    await dumpStackAndContinue(p, false);
+    p.assertLog();
+  });
+
+  itIntegrates('shows sourcemapped stack during shutdown', async ({ r }) => {
+    createFileTree(testFixturesDir, {
+      'input.js': [
+        "console.log(new Error('asdf'));",
+        "throw new Error('asdf');",
+        '//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiaW5wdXQuanMiLCJzb3VyY2VSb290IjoiIiwic291cmNlcyI6WyJpbnB1dC50cyJdLCJuYW1lcyI6W10sIm1hcHBpbmdzIjoiQUFBQSxPQUFPLENBQUMsR0FBRyxDQUFDLElBQUksS0FBSyxDQUFDLE1BQU0sQ0FBQyxDQUFDLENBQUM7QUFDL0IsTUFBTSxJQUFJLEtBQUssQ0FBQyxNQUFNLENBQUMsQ0FBQyJ9',
+      ],
+      'input.ts': ["console.log(new Error('asdf'));", "throw new Error('asdf');"],
+    });
+    const handle = await r.runScript('input.js');
+    handle.load();
+    const output1 = (await handle.dap.once('output'))?.output;
+    expect(output1).to.contain('input.ts');
+    const output2 = (await handle.dap.once('output'))?.output;
+    expect(output2).to.contain('input.ts');
   });
 });

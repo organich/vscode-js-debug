@@ -1,7 +1,8 @@
 /*---------------------------------------------------------
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
-import { JSONSchema6 } from 'json-schema';
+import { JSONSchema6, JSONSchema6Definition } from 'json-schema';
+import type strings from '../../package.nls.json';
 import {
   allCommands,
   allDebugTypes,
@@ -9,13 +10,14 @@ import {
   Commands,
   Configuration,
   ContextKey,
-  Contributions,
   CustomViews,
   DebugType,
   IConfigurationTypes,
+  networkFilesystemScheme,
   preferredDebugTypes,
 } from '../common/contributionUtils';
 import { knownToolToken } from '../common/knownTools';
+import { nodeInternalsToken } from '../common/node15Internal';
 import { mapValues, sortKeys, walkObject } from '../common/objUtils';
 import {
   AnyLaunchConfiguration,
@@ -45,7 +47,6 @@ import {
   ResolvingConfiguration,
   terminalBaseDefaults,
 } from '../configuration';
-import strings from './strings';
 
 const appInsightsKey = '0c6ae279ed8443289764825290e4f9e2-1a736e7c-1324-4338-be46-fc2a58ae4d14-7255';
 
@@ -58,12 +59,20 @@ type OmittedKeysFromAttributes =
   | '__remoteFilePrefix'
   | '__sessionId';
 
-export type DescribedAttribute<T> = JSONSchema6 &
-  Described & {
+const enum Tag {
+  // A useful attribute for project setup.
+  Setup = 'setup',
+}
+
+export type DescribedAttribute<T> =
+  & JSONSchema6
+  & Described
+  & {
     default: T;
     docDefault?: string;
     enum?: Array<T>;
     enumDescriptions?: MappedReferenceString[];
+    tags?: Tag[];
   };
 
 type ConfigurationAttributes<T> = {
@@ -80,7 +89,7 @@ type Menus = {
     command: Commands;
     title?: MappedReferenceString;
     when?: string;
-    group?: 'navigation' | 'inline';
+    group?: 'navigation' | 'inline' | string;
   }[];
 };
 
@@ -105,8 +114,8 @@ const forNodeDebugType = (contextKey: string, andExpr?: string) =>
  */
 type MappedReferenceString = { __opaque: true } & string;
 
-// eslint-disable-next-line
-const refString = (str: keyof typeof strings): MappedReferenceString => `%${str}%` as any;
+const refString = (str: keyof typeof strings & string): MappedReferenceString =>
+  `%${str}%` as unknown as MappedReferenceString;
 
 /**
  * Type definition for a debugger section. VSCode doesn't publish these types,
@@ -149,6 +158,7 @@ const baseConfigurationAttributes: ConfigurationAttributes<IBaseConfiguration> =
     items: {
       type: 'string',
     },
+    tags: [Tag.Setup],
   },
   pauseForSourceMap: {
     type: 'boolean',
@@ -187,7 +197,7 @@ const baseConfigurationAttributes: ConfigurationAttributes<IBaseConfiguration> =
   skipFiles: {
     type: 'array',
     description: refString('browser.skipFiles.description'),
-    default: ['<node_internals>/**'],
+    default: ['${/**'],
   },
   smartStep: {
     type: 'boolean',
@@ -296,6 +306,11 @@ const baseConfigurationAttributes: ConfigurationAttributes<IBaseConfiguration> =
     default: [],
     description: refString('base.cascadeTerminateToConfigurations.label'),
   },
+  enableDWARF: {
+    type: 'boolean',
+    default: true,
+    markdownDescription: refString('base.enableDWARF.label'),
+  },
 };
 
 /**
@@ -312,6 +327,7 @@ const nodeBaseConfigurationAttributes: ConfigurationAttributes<INodeBaseConfigur
     description: refString('node.launch.cwd.description'),
     default: '${workspaceFolder}',
     docDefault: 'localRoot || ${workspaceFolder}',
+    tags: [Tag.Setup],
   },
   localRoot: {
     type: ['string', 'null'],
@@ -335,6 +351,7 @@ const nodeBaseConfigurationAttributes: ConfigurationAttributes<INodeBaseConfigur
     },
     markdownDescription: refString('node.launch.env.description'),
     default: {},
+    tags: [Tag.Setup],
   },
   envFile: {
     type: 'string',
@@ -357,6 +374,16 @@ const nodeBaseConfigurationAttributes: ConfigurationAttributes<INodeBaseConfigur
   },
 };
 
+const intOrEvaluated: JSONSchema6Definition[] = [
+  {
+    type: 'integer',
+  },
+  {
+    type: 'string',
+    pattern: '^\\${.*}$',
+  },
+];
+
 /**
  * Node attach configuration.
  */
@@ -377,7 +404,7 @@ const nodeAttachConfig: IDebugger<INodeAttachConfiguration> = {
         request: 'attach',
         name: '${1:Attach}',
         port: 9229,
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
     {
@@ -391,7 +418,7 @@ const nodeAttachConfig: IDebugger<INodeAttachConfiguration> = {
         port: 9229,
         localRoot: '^"\\${workspaceFolder}"',
         remoteRoot: '${3:Absolute path to the remote directory containing the program}',
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
     {
@@ -402,7 +429,7 @@ const nodeAttachConfig: IDebugger<INodeAttachConfiguration> = {
         request: 'attach',
         name: '${1:Attach by Process ID}',
         processId: '^"\\${command:PickProcess}"',
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
   ],
@@ -414,13 +441,19 @@ const nodeAttachConfig: IDebugger<INodeAttachConfiguration> = {
       default: 'localhost',
     },
     port: {
-      type: 'number',
       description: refString('node.port.description'),
       default: 9229,
+      oneOf: intOrEvaluated,
+      tags: [Tag.Setup],
     },
     websocketAddress: {
       type: 'string',
       description: refString('node.websocket.address.description'),
+      default: undefined,
+    },
+    remoteHostHeader: {
+      type: 'string',
+      description: refString('node.remote.host.header.description'),
       default: undefined,
     },
     restart: {
@@ -478,7 +511,7 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
         request: 'launch',
         name: '${2:Launch Program}',
         program: '^"\\${workspaceFolder}/${1:app.js}"',
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
     {
@@ -490,7 +523,7 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
         name: '${1:Launch via NPM}',
         runtimeExecutable: 'npm',
         runtimeArgs: ['run-script', 'debug'],
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
     {
@@ -505,7 +538,7 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
         restart: true,
         console: 'integratedTerminal',
         internalConsoleOptions: 'neverOpen',
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
     {
@@ -515,10 +548,17 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
         type: DebugType.Node,
         request: 'launch',
         name: 'Mocha Tests',
-        program: '^"\\${workspaceFolder}/node_modules/mocha/bin/_mocha"',
-        args: ['-u', 'tdd', '--timeout', '999999', '--colors', '^"\\${workspaceFolder}/${1:test}"'],
+        program: '^"mocha"',
+        args: [
+          '-u',
+          'tdd',
+          '--timeout',
+          '999999',
+          '--colors',
+          '^"\\${workspaceFolder}/${1:test}"',
+        ],
         internalConsoleOptions: 'openOnSessionStart',
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
     {
@@ -532,7 +572,7 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
         args: ['${1:generator}'],
         console: 'integratedTerminal',
         internalConsoleOptions: 'neverOpen',
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
     {
@@ -544,7 +584,7 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
         name: 'Gulp ${1:task}',
         program: '^"\\${workspaceFolder}/node_modules/gulp/bin/gulp.js"',
         args: ['${1:task}'],
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
     {
@@ -554,9 +594,9 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
         type: DebugType.Node,
         request: 'launch',
         name: 'Electron Main',
-        runtimeExecutable: '^"\\${workspaceFolder}/node_modules/.bin/electron"',
+        runtimeExecutable: '^"electron"',
         program: '^"\\${workspaceFolder}/main.js"',
-        skipFiles: ['<node_internals>/**'],
+        skipFiles: [`${nodeInternalsToken}/**`],
       },
     },
   ],
@@ -566,11 +606,13 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
       type: 'string',
       description: refString('node.launch.cwd.description'),
       default: '${workspaceFolder}',
+      tags: [Tag.Setup],
     },
     program: {
       type: 'string',
       description: refString('node.launch.program.description'),
       default: '',
+      tags: [Tag.Setup],
     },
     stopOnEntry: {
       type: ['boolean', 'string'],
@@ -595,6 +637,7 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
         type: 'string',
       },
       default: [],
+      tags: [Tag.Setup],
     },
     restart: {
       description: refString('node.launch.restart.description'),
@@ -617,6 +660,7 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
         type: 'string',
       },
       default: [],
+      tags: [Tag.Setup],
     },
     profileStartup: {
       type: 'boolean',
@@ -624,7 +668,7 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
       default: true,
     },
     attachSimplePort: {
-      type: 'integer',
+      oneOf: intOrEvaluated,
       description: refString('node.attachSimplePort.description'),
       default: 9229,
     },
@@ -633,6 +677,12 @@ const nodeLaunchConfig: IDebugger<INodeLaunchConfiguration> = {
       enum: [KillBehavior.Forceful, KillBehavior.Polite, KillBehavior.None],
       default: KillBehavior.Forceful,
       markdownDescription: refString('node.killBehavior.description'),
+    },
+    experimentalNetworking: {
+      type: 'string',
+      default: 'auto',
+      description: refString('node.experimentalNetworking.description'),
+      enum: ['auto', 'on', 'off'],
     },
   },
   defaults: nodeLaunchConfigDefaults,
@@ -661,6 +711,7 @@ const nodeTerminalConfiguration: IDebugger<ITerminalLaunchConfiguration> = {
       type: ['string', 'null'],
       description: refString('debug.terminal.program.description'),
       default: 'npm start',
+      tags: [Tag.Setup],
     },
   },
   defaults: terminalBaseDefaults,
@@ -685,6 +736,7 @@ const chromiumBaseConfigurationAttributes: ConfigurationAttributes<IChromiumBase
     type: 'string',
     description: refString('browser.webRoot.description'),
     default: '${workspaceFolder}',
+    tags: [Tag.Setup],
   },
   urlFilter: {
     type: 'string',
@@ -695,6 +747,7 @@ const chromiumBaseConfigurationAttributes: ConfigurationAttributes<IChromiumBase
     type: 'string',
     description: refString('browser.url.description'),
     default: 'http://localhost:8080',
+    tags: [Tag.Setup],
   },
   inspectUri: {
     type: ['string', 'null'],
@@ -744,9 +797,10 @@ const chromiumAttachConfigurationAttributes: ConfigurationAttributes<IChromeAtta
     default: 'localhost',
   },
   port: {
-    type: 'number',
+    oneOf: intOrEvaluated,
     description: refString('browser.attach.port.description'),
     default: 9229,
+    tags: [Tag.Setup],
   },
   restart: {
     type: 'boolean',
@@ -803,6 +857,7 @@ const chromeLaunchConfig: IDebugger<IChromeLaunchConfiguration> = {
       type: 'string',
       description: refString('browser.file.description'),
       default: '${workspaceFolder}/index.html',
+      tags: [Tag.Setup],
     },
     userDataDir: {
       type: ['string', 'boolean'],
@@ -897,7 +952,7 @@ const extensionHostConfig: IDebugger<IExtensionHostLaunchConfiguration> = {
   request: 'launch',
   label: refString('extensionHost.label'),
   languages: commonLanguages,
-  required: ['args'],
+  required: [],
   configurationSnippets: [
     {
       label: refString('extensionHost.snippet.launch.label'),
@@ -921,6 +976,7 @@ const extensionHostConfig: IDebugger<IExtensionHostLaunchConfiguration> = {
         type: 'string',
       },
       default: ['--extensionDevelopmentPath=${workspaceFolder}'],
+      tags: [Tag.Setup],
     },
     runtimeExecutable: {
       type: ['string', 'null'],
@@ -944,6 +1000,16 @@ const extensionHostConfig: IDebugger<IExtensionHostLaunchConfiguration> = {
         webRoot: '${workspaceFolder}',
       },
       properties: chromiumAttachConfigurationAttributes as { [key: string]: JSONSchema6 },
+    },
+    testConfiguration: {
+      markdownDescription: refString('extensionHost.launch.testConfiguration'),
+      type: 'string',
+      default: '${workspaceFolder}/.vscode-test.js',
+    },
+    testConfigurationLabel: {
+      markdownDescription: refString('extensionHost.launch.testConfigurationLabel'),
+      type: 'string',
+      default: '',
     },
   },
   defaults: extensionHostConfigDefaults,
@@ -1037,7 +1103,7 @@ export const debuggers = [
 function buildDebuggers() {
   // eslint-disable-next-line
   const output: any[] = [];
-  const ensureEntryForType = (type: string, d: typeof debuggers[0]) => {
+  const ensureEntryForType = (type: string, d: (typeof debuggers)[0]) => {
     let entry = output.find(o => o.type === type);
     if (entry) {
       return entry;
@@ -1184,6 +1250,11 @@ const configurationSchema: ConfigurationAttributes<IConfigurationTypes> = {
     default: {},
     markdownDescription: refString('configuration.resourceRequestOptions'),
   },
+  [Configuration.EnableNetworkView]: {
+    type: 'boolean',
+    default: false,
+    description: refString('configuration.enableNetworkView'),
+  },
 };
 
 const commands: ReadonlyArray<{
@@ -1204,19 +1275,29 @@ const commands: ReadonlyArray<{
     category: 'Debug',
   },
   {
-    command: Commands.AddCustomBreakpoints,
-    title: refString('add.browser.breakpoint'),
+    command: Commands.ToggleCustomBreakpoints,
+    title: refString('add.eventListener.breakpoint'),
     icon: '$(add)',
   },
   {
-    command: Commands.RemoveCustomBreakpoint,
-    title: refString('remove.browser.breakpoint'),
+    command: Commands.RemoveAllCustomBreakpoints,
+    title: refString('remove.eventListener.breakpoint.all'),
+    icon: '$(close-all)',
+  },
+  {
+    command: Commands.AddXHRBreakpoints,
+    title: refString('add.xhr.breakpoint'),
+    icon: '$(add)',
+  },
+  {
+    command: Commands.RemoveXHRBreakpoints,
+    title: refString('remove.xhr.breakpoint'),
     icon: '$(remove)',
   },
   {
-    command: Commands.RemoveAllCustomBreakpoints,
-    title: refString('remove.browser.breakpoint.all'),
-    icon: '$(close-all)',
+    command: Commands.EditXHRBreakpoint,
+    title: refString('edit.xhr.breakpoint'),
+    icon: '$(edit)',
   },
   {
     command: Commands.AttachProcess,
@@ -1311,6 +1392,32 @@ const commands: ReadonlyArray<{
     title: refString('commands.disableSourceMapStepping.label'),
     icon: '$(compass)',
   },
+  {
+    command: Commands.NetworkViewRequest,
+    title: refString('commands.networkViewRequest.label'),
+    icon: '$(arrow-right)',
+  },
+  {
+    command: Commands.NetworkClear,
+    title: refString('commands.networkClear.label'),
+    icon: '$(clear-all)',
+  },
+  {
+    command: Commands.NetworkOpenBody,
+    title: refString('commands.networkOpenBody.label'),
+  },
+  {
+    command: Commands.NetworkOpenBodyHex,
+    title: refString('commands.networkOpenBodyInHexEditor.label'),
+  },
+  {
+    command: Commands.NetworkReplayXHR,
+    title: refString('commands.networkReplayXHR.label'),
+  },
+  {
+    command: Commands.NetworkCopyUri,
+    title: refString('commands.networkCopyURI.label'),
+  },
 ];
 
 const menus: Menus = {
@@ -1318,7 +1425,7 @@ const menus: Menus = {
     {
       command: Commands.PrettyPrint,
       title: refString('pretty.print.script'),
-      when: forAnyDebugType('debugType', 'inDebugMode'),
+      when: forAnyDebugType('debugType', 'debugState == stopped'),
     },
     {
       command: Commands.StartProfile,
@@ -1368,16 +1475,36 @@ const menus: Menus = {
       when: 'false',
     },
     {
+      command: Commands.NetworkCopyUri,
+      when: 'false',
+    },
+    {
+      command: Commands.NetworkOpenBody,
+      when: 'false',
+    },
+    {
+      command: Commands.NetworkOpenBodyHex,
+      when: 'false',
+    },
+    {
+      command: Commands.NetworkReplayXHR,
+      when: 'false',
+    },
+    {
+      command: Commands.NetworkViewRequest,
+      when: 'false',
+    },
+    {
+      command: Commands.NetworkClear,
+      when: 'false',
+    },
+    {
       command: Commands.EnableSourceMapStepping,
       when: ContextKey.IsMapSteppingDisabled,
     },
     {
       command: Commands.DisableSourceMapStepping,
       when: `!${ContextKey.IsMapSteppingDisabled}`,
-    },
-    {
-      command: Commands.EnableSourceMapStepping,
-      when: ContextKey.IsMapSteppingDisabled,
     },
   ],
   'debug/callstack/context': [
@@ -1432,12 +1559,14 @@ const menus: Menus = {
   ],
   'view/title': [
     {
-      command: Commands.AddCustomBreakpoints,
-      when: `view == ${CustomViews.BrowserBreakpoints}`,
+      command: Commands.ToggleCustomBreakpoints,
+      when: `view == ${CustomViews.EventListenerBreakpoints}`,
+      group: 'navigation',
     },
     {
       command: Commands.RemoveAllCustomBreakpoints,
-      when: `view == ${CustomViews.BrowserBreakpoints}`,
+      when: `view == ${CustomViews.EventListenerBreakpoints}`,
+      group: 'navigation',
     },
     {
       command: Commands.CallersRemoveAll,
@@ -1460,22 +1589,40 @@ const menus: Menus = {
         `view == workbench.debug.callStackView && ${ContextKey.IsMapSteppingDisabled}`,
       ),
     },
+    {
+      command: Commands.NetworkClear,
+      group: 'navigation',
+      when: `view == ${CustomViews.Network}`,
+    },
   ],
   'view/item/context': [
     {
-      command: Commands.RemoveCustomBreakpoint,
-      when: `view == ${CustomViews.BrowserBreakpoints}`,
+      command: Commands.AddXHRBreakpoints,
+      when: `view == ${CustomViews.EventListenerBreakpoints} && viewItem == xhrBreakpoint`,
+    },
+    {
+      command: Commands.EditXHRBreakpoint,
+      when: `view == ${CustomViews.EventListenerBreakpoints} && viewItem == xhrBreakpoint`,
       group: 'inline',
     },
     {
-      command: Commands.AddCustomBreakpoints,
-      when: `view == ${CustomViews.BrowserBreakpoints}`,
+      command: Commands.EditXHRBreakpoint,
+      when: `view == ${CustomViews.EventListenerBreakpoints} && viewItem == xhrBreakpoint`,
     },
     {
-      command: Commands.RemoveCustomBreakpoint,
-      when: `view == ${CustomViews.BrowserBreakpoints}`,
+      command: Commands.RemoveXHRBreakpoints,
+      when: `view == ${CustomViews.EventListenerBreakpoints} && viewItem == xhrBreakpoint`,
+      group: 'inline',
     },
-
+    {
+      command: Commands.RemoveXHRBreakpoints,
+      when: `view == ${CustomViews.EventListenerBreakpoints} && viewItem == xhrBreakpoint`,
+    },
+    {
+      command: Commands.AddXHRBreakpoints,
+      when: `view == ${CustomViews.EventListenerBreakpoints} && viewItem == xhrCategory`,
+      group: 'inline',
+    },
     {
       command: Commands.CallersGoToCaller,
       group: 'inline',
@@ -1491,12 +1638,37 @@ const menus: Menus = {
       group: 'inline',
       when: `view == ${CustomViews.ExcludedCallers}`,
     },
+    {
+      command: Commands.NetworkViewRequest,
+      group: 'inline@1',
+      when: `view == ${CustomViews.Network}`,
+    },
+    {
+      command: Commands.NetworkOpenBody,
+      group: 'body@1',
+      when: `view == ${CustomViews.Network}`,
+    },
+    {
+      command: Commands.NetworkOpenBodyHex,
+      group: 'body@2',
+      when: `view == ${CustomViews.Network}`,
+    },
+    {
+      command: Commands.NetworkCopyUri,
+      group: 'other@1',
+      when: `view == ${CustomViews.Network}`,
+    },
+    {
+      command: Commands.NetworkReplayXHR,
+      group: 'other@2',
+      when: `view == ${CustomViews.Network}`,
+    },
   ],
   'editor/title': [
     {
       command: Commands.PrettyPrint,
       group: 'navigation',
-      when: `resource in ${ContextKey.CanPrettyPrint}`,
+      when: `debugState == stopped && resource in ${ContextKey.CanPrettyPrint}`,
     },
   ],
 };
@@ -1535,8 +1707,8 @@ const viewsWelcome = [
 const views = {
   debug: [
     {
-      id: CustomViews.BrowserBreakpoints,
-      name: 'Browser breakpoints',
+      id: CustomViews.EventListenerBreakpoints,
+      name: 'Event Listener Breakpoints',
       when: forBrowserDebugType('debugType'),
     },
     {
@@ -1544,8 +1716,28 @@ const views = {
       name: 'Excluded Callers',
       when: forAnyDebugType('debugType', 'jsDebugHasExcludedCallers'),
     },
+    {
+      id: CustomViews.Network,
+      name: 'Network',
+      when: ContextKey.NetworkAvailable,
+    },
   ],
 };
+
+const activationEvents = new Set([
+  'onDebugDynamicConfigurations',
+  'onDebugInitialConfigurations',
+  `onFileSystem:${networkFilesystemScheme}`,
+  ...[...debuggers.map(dbg => dbg.type), ...preferredDebugTypes.values()].map(
+    t => `onDebugResolve:${t}`,
+  ),
+  ...[...allCommands].map(cmd => `onCommand:${cmd}`),
+]);
+
+// remove implicit commands:
+for (const { command } of commands) {
+  activationEvents.delete(`onCommand:${command}`);
+}
 
 if (require.main === module) {
   process.stdout.write(
@@ -1557,16 +1749,7 @@ if (require.main === module) {
           description: refString('workspaceTrust.description'),
         },
       },
-      activationEvents: Array.from(
-        new Set([
-          ...[...allCommands].map(cmd => `onCommand:${cmd}`),
-          ...[...debuggers.map(dbg => dbg.type), ...preferredDebugTypes.values()].map(
-            t => `onDebugResolve:${t}`,
-          ),
-          ...views.debug.map(v => `onView:${v.id}`),
-          `onWebviewPanel:${Contributions.DiagnosticsView}`,
-        ]),
-      ),
+      activationEvents: [...activationEvents],
       contributes: {
         menus,
         breakpoints: breakpointLanguages.map(language => ({ language })),
@@ -1576,6 +1759,31 @@ if (require.main === module) {
         configuration: {
           title: 'JavaScript Debugger',
           properties: configurationSchema,
+        },
+        grammars: [
+          {
+            language: 'wat',
+            scopeName: 'text.wat',
+            path: './src/ui/basic-wat.tmLanguage.json',
+          },
+        ],
+        languages: [
+          {
+            id: 'wat',
+            extensions: ['.wat', '.wasm'],
+            aliases: ['WebAssembly Text Format'],
+            firstLine: '^\\(module',
+            mimetypes: ['text/wat'],
+          },
+        ],
+        terminal: {
+          profiles: [
+            {
+              id: 'extension.js-debug.debugTerminal',
+              title: refString('debug.terminal.label'),
+              icon: '$(debug)',
+            },
+          ],
         },
         views,
         viewsWelcome,

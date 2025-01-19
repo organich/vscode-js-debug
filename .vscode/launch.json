@@ -5,19 +5,19 @@
       "type": "node",
       "request": "launch",
       "name": "Generate CDP API",
-      "program": "${workspaceFolder}/scripts/generate-cdp-api.js"
+      "program": "${workspaceFolder}/dist/src/build/generateCdp.js"
     },
     {
       "type": "node",
       "request": "launch",
       "name": "Generate DAP API",
-      "program": "${workspaceFolder}/scripts/generate-dap-api.js"
+      "program": "${workspaceFolder}/dist/src/build/generateDap.js"
     },
     {
       "type": "node",
       "request": "launch",
       "name": "Debug Server",
-      "program": "${workspaceFolder}/out/src/debugServerMain.js",
+      "program": "${workspaceFolder}/dist/src/debugServerMain.js",
       "args": [
         "4711"
       ]
@@ -28,7 +28,7 @@
       "request": "launch",
       "name": "Debug Server (Flat Session)",
       "trace": true,
-      "program": "${workspaceFolder}/out/src/flatSessionLauncher.js",
+      "program": "${workspaceFolder}/dist/src/flatSessionLauncher.js",
       "args": [
         "4712"
       ],
@@ -42,7 +42,7 @@
       "request": "launch",
       "name": "Debug Server (VS Server)",
       "trace": true,
-      "program": "${workspaceFolder}/out/src/vsDebugServer.js",
+      "program": "${workspaceFolder}/dist/src/vsDebugServer.js",
       "args": [
         "4712"
       ],
@@ -52,25 +52,18 @@
       // "preLaunchTask": "npm: watch"
     },
     {
-      "name": "Extension",
-      "type": "pwa-extensionHost",
+      "type": "node",
       "request": "launch",
+      "name": "Debug Server (DAP)",
+      "trace": true,
+      "program": "${workspaceFolder}/dist/src/dapDebugServer.js",
       "skipFiles": [
-        "<node_internals>/**"
-      ],
-      "args": [
-        "--enable-proposed-api=ms-vscode.js-debug",
-        "--extensionDevelopmentPath=${workspaceFolder}/out",
-        "--extensionDevelopmentPath=${workspaceFolder}/../vscode-hexeditor",
-      ],
-      "outFiles": [
-        "${workspaceFolder}/out/**/*.js",
-        "${workspaceFolder}/../vscode/extensions/debug-auto-launch/out/**/*.js"
+        "<node_internals>/**/*.js"
       ]
       // "preLaunchTask": "npm: watch"
     },
     {
-      "name": "Extension (packaged)",
+      "name": "Extension",
       "type": "extensionHost",
       "request": "launch",
       "skipFiles": [
@@ -86,6 +79,25 @@
       // "preLaunchTask": "npm: watch"
     },
     {
+      "name": "Extension With Local DAP",
+      "type": "extensionHost",
+      "request": "launch",
+      "skipFiles": [
+        "<node_internals>/**"
+      ],
+      "args": [
+        "--enable-proposed-api=ms-vscode.js-debug",
+        "--extensionDevelopmentPath=${workspaceFolder}/dist"
+      ],
+      "env": {
+        "JS_DEBUG_USE_LOCAL_DAP_PORT": "8123"
+      },
+      "outFiles": [
+        "${workspaceFolder}/dist/**/*.js"
+      ]
+      // "preLaunchTask": "npm: watch"
+    },
+    {
       "name": "Extension and Auto Launch",
       "type": "pwa-extensionHost",
       "request": "launch",
@@ -95,7 +107,7 @@
       "args": [
         "--enable-proposed-api=ms-vscode.js-debug",
         "--extensionDevelopmentPath=${workspaceFolder}/../vscode/extensions/debug-auto-launch",
-        "--extensionDevelopmentPath=${workspaceFolder}/out"
+        "--extensionDevelopmentPath=${workspaceFolder}/dist"
       ],
       "resolveSourceMapLocations": [
         "${workspaceFolder}/**",
@@ -103,13 +115,13 @@
         "!**/node_modules/**"
       ],
       "outFiles": [
-        "${workspaceFolder}/out/**/*.js",
+        "${workspaceFolder}/dist/**/*.js",
         "${workspaceFolder}/../vscode-js-debug-companion/out/**/*.js"
       ]
     },
     {
       "name": "Extension and Companion",
-      "type": "pwa-extensionHost",
+      "type": "extensionHost",
       "request": "launch",
       "skipFiles": [
         "<node_internals>/**"
@@ -117,7 +129,7 @@
       "args": [
         "--enable-proposed-api=ms-vscode.js-debug",
         "--extensionDevelopmentPath=${workspaceFolder}/../vscode-js-debug-companion",
-        "--extensionDevelopmentPath=${workspaceFolder}/out"
+        "--extensionDevelopmentPath=${workspaceFolder}/dist"
       ],
       "env": {
         "JS_DEBUG_USE_COMPANION": "1"
@@ -129,7 +141,7 @@
         "!**/node_modules/**"
       ],
       "outFiles": [
-        "${workspaceFolder}/out/**/*.js",
+        "${workspaceFolder}/dist/**/*.js",
         "${workspaceFolder}/../vscode-js-debug-companion/out/**/*.js"
       ]
     },
@@ -141,11 +153,11 @@
         "<node_internals>/**"
       ],
       "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/out",
-        "--extensionTestsPath=${workspaceFolder}/out/src/test/testRunner"
+        "--extensionDevelopmentPath=${workspaceFolder}/dist",
+        "--extensionTestsPath=${workspaceFolder}/dist/src/testRunner"
       ],
       "outFiles": [
-        "${workspaceFolder}/out/**/*.js"
+        "${workspaceFolder}/dist/**/*.js"
       ]
     },
     {
@@ -161,7 +173,7 @@
         ".mocharc.unit.js"
       ],
       "outFiles": [
-        "${workspaceFolder}/out/**/*.js"
+        "${workspaceFolder}/dist/**/*.js"
       ]
     },
     {

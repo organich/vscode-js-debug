@@ -35,6 +35,11 @@ export interface IBreakpointCondition {
 export const AlwaysBreak = new SimpleCondition({ line: 0 }, undefined);
 
 /**
+ * Condition that indicates we should never break at the give spot.
+ */
+export const NeverBreak = new SimpleCondition({ line: 0 }, 'false');
+
+/**
  * Creates breakpoint conditions for source breakpoints.
  */
 export interface IBreakpointConditionFactory {
@@ -60,7 +65,12 @@ export class BreakpointConditionFactory implements IBreakpointConditionFactory {
 
   public getConditionFor(params: Dap.SourceBreakpoint): IBreakpointCondition {
     if (params.condition) {
-      return ExpressionCondition.parse(params, params.condition, this.breakOnError, this.evaluator);
+      return ExpressionCondition.parse(
+        params,
+        params.condition,
+        this.breakOnError,
+        this.evaluator,
+      );
     }
 
     if (params.logMessage) {

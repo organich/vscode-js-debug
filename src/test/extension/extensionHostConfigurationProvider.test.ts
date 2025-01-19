@@ -43,7 +43,9 @@ describe('ExtensionHostConfigurationProvider', () => {
       createFileTree(testFixturesDir, {
         'withWeb/package.json': JSON.stringify({ extensionKind: ['web'] }),
         'withoutWeb/package.json': JSON.stringify({}),
-      }),
+        'withEntrypoint1/package.json': JSON.stringify({ main: './foo/j/x.js' }),
+        'withEntrypoint2/nested/package.json': JSON.stringify({ main: './bar/j/x.js' }),
+      })
     );
 
     it('does not enable if no args', async () => {
@@ -60,7 +62,10 @@ describe('ExtensionHostConfigurationProvider', () => {
     });
 
     it('does not enable if enoent folder', async () => {
-      const result = await provider.resolveDebugConfiguration(folder('doesNotExist'), emptyRequest);
+      const result = await provider.resolveDebugConfiguration(
+        folder('doesNotExist'),
+        emptyRequest,
+      );
       expect(result?.debugWebWorkerHost).to.be.false;
     });
 
@@ -75,6 +80,24 @@ describe('ExtensionHostConfigurationProvider', () => {
     it('enables if all good', async () => {
       const result = await provider.resolveDebugConfiguration(folder('withWeb'), emptyRequest);
       expect(result?.debugWebWorkerHost).to.be.true;
+    });
+
+    it('guesses outfiles 1', async () => {
+      const result = await provider.resolveDebugConfiguration(
+        folder('withEntrypoint1'),
+        emptyRequest,
+      );
+      expect(result?.outFiles).to.deep.equal(['${workspaceFolder}/foo/**/*.js']);
+    });
+
+    it('guesses outfiles 2', async () => {
+      const result = await provider.resolveDebugConfiguration(folder('withEntrypoint2'), {
+        type: DebugType.ExtensionHost,
+        name: '',
+        request: '',
+        args: ['--extensionDevelopmentPath=${workspaceFolder}/nested'],
+      });
+      expect(result?.outFiles).to.deep.equal(['${workspaceFolder}/nested/bar/**/*.js']);
     });
   });
 });

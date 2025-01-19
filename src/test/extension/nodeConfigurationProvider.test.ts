@@ -175,7 +175,9 @@ describe('NodeDebugConfigurationProvider', () => {
         'tsconfig.json': JSON.stringify({ compilerOptions: { outDir: 'out' } }),
       });
 
-      const doc = await vscode.workspace.openTextDocument(join(testFixturesDir, 'src', 'hello.ts'));
+      const doc = await vscode.workspace.openTextDocument(
+        join(testFixturesDir, 'src', 'hello.ts'),
+      );
       await vscode.window.showTextDocument(doc);
       try {
         const result = await provider.resolveDebugConfiguration(folder, emptyRequest);
@@ -321,7 +323,10 @@ describe('NodeDebugConfigurationProvider', () => {
         program: 'hello.js',
       });
 
-      expect(result?.outFiles).to.deep.equal(['${workspaceFolder}/**/*.js', '!**/node_modules/**']);
+      expect(result?.outFiles).to.deep.equal([
+        '${workspaceFolder}/**/*.(m|c|)js',
+        '!**/node_modules/**',
+      ]);
     });
 
     it('preserves outFiles if package.json is in the same folder', async () => {
@@ -337,7 +342,10 @@ describe('NodeDebugConfigurationProvider', () => {
         program: 'hello.js',
       });
 
-      expect(result?.outFiles).to.deep.equal(['${workspaceFolder}/**/*.js', '!**/node_modules/**']);
+      expect(result?.outFiles).to.deep.equal([
+        '${workspaceFolder}/**/*.(m|c|)js',
+        '!**/node_modules/**',
+      ]);
     });
 
     it('gets the nearest nested package.json', async () => {
@@ -362,7 +370,7 @@ describe('NodeDebugConfigurationProvider', () => {
       );
 
       expect(result?.outFiles).to.deep.equal([
-        '${workspaceFolder}/**/*.js',
+        '${workspaceFolder}/**/*.(m|c|)js',
         '!**/node_modules/**',
         '${workspaceFolder}/../a/b/**/*.js',
         '!${workspaceFolder}/../a/b/**/node_modules/**',
@@ -391,7 +399,7 @@ describe('NodeDebugConfigurationProvider', () => {
       );
 
       expect(result?.outFiles).to.deep.equal([
-        '${workspaceFolder}/**/*.js',
+        '${workspaceFolder}/**/*.(m|c|)js',
         '!**/node_modules/**',
         '${workspaceFolder}/../a/**/*.js',
         '!${workspaceFolder}/../a/**/node_modules/**',
@@ -418,7 +426,10 @@ describe('NodeDebugConfigurationProvider', () => {
         },
       );
 
-      expect(result?.outFiles).to.deep.equal(['${workspaceFolder}/**/*.js', '!**/node_modules/**']);
+      expect(result?.outFiles).to.deep.equal([
+        '${workspaceFolder}/**/*.(m|c|)js',
+        '!**/node_modules/**',
+      ]);
     });
   });
 

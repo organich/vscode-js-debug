@@ -7,9 +7,9 @@ import { remoteFunction } from '.';
 /**
  * Gets the object property.
  */
-export const invokeGetter = remoteFunction(function (
-  this: { [key: string]: unknown },
-  property: string | number,
+export const invokeGetter = remoteFunction(function(
+  this: unknown,
+  getterFn: (this: unknown) => unknown,
 ) {
-  return this[property];
+  return getterFn.call(this);
 });

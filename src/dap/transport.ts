@@ -4,18 +4,19 @@
 
 import { Readable, Writable } from 'stream';
 import { Event } from 'vscode';
-import { EventEmitter } from '../common/events';
 import { IDisposable } from '../common/disposable';
-import { ILogger, LogTag } from '../common/logging';
+import { EventEmitter } from '../common/events';
 import { HrTime } from '../common/hrnow';
+import { ILogger, LogTag } from '../common/logging';
 
 const _TWO_CRLF = '\r\n\r\n';
 
 let connectionId = 0;
 
-export type Message = (
-  | { type: 'request'; command: string; arguments: object }
-  | {
+export type Message =
+  & (
+    | { type: 'request'; command: string; arguments: object }
+    | {
       type: 'response';
       message?: string;
       command: string;
@@ -23,12 +24,13 @@ export type Message = (
       success: boolean;
       body: object;
     }
-  | { type: 'event'; event: string; body: object }
-) & {
-  sessionId?: string;
-  seq: number;
-  __receivedTime?: bigint;
-};
+    | { type: 'event'; event: string; body: object }
+  )
+  & {
+    sessionId?: string;
+    seq: number;
+    __receivedTime?: bigint;
+  };
 
 /**
  * An interface which represents the transport layer for sending/receiving DAP messages
@@ -39,7 +41,7 @@ export interface IDapTransport {
    * @param message The DAP message to send
    * @param shouldLog Whether or not the transport layer should log this message
    */
-  send(message: Message, shouldLog?: boolean): void;
+  send(message: Message, shouldLog?: boolean, onDidWrite?: () => void): void;
 
   /** Close the connection for this transport */
   close(): void;
@@ -77,7 +79,7 @@ export class StreamDapTransport implements IDapTransport {
     inputStream.on('data', this._handleData);
   }
 
-  send(message: Message, shouldLog = true): void {
+  send(message: Message, shouldLog = true, onDidWrite?: () => void): void {
     const json = JSON.stringify(message);
     if (shouldLog) {
       let objectToLog = message;
@@ -95,17 +97,21 @@ export class StreamDapTransport implements IDapTransport {
     const data = `Content-Length: ${Buffer.byteLength(json, 'utf8')}\r\n\r\n${json}`;
     if (this.outputStream.destroyed) {
       this.logger?.warn(LogTag.DapSend, 'Message not sent. Connection was closed.');
+      onDidWrite?.();
       return;
     }
 
     this.outputStream.write(data, 'utf8', err => {
+      onDidWrite?.();
       if (err) {
+        console.log(message);
         this.logger?.error(LogTag.DapSend, 'Error while writing to output stream', err);
         this.close();
       }
     });
   }
-  close(): void {
+
+  close() {
     this.inputStream.destroy();
     this.outputStream.destroy();
   }
@@ -180,10 +186,10 @@ export class SessionIdDapTransport implements IDapTransport {
     this.disposables.push(rootTransport.closed(() => this.close()));
   }
 
-  send(msg: Message, shouldLog?: boolean) {
+  send(msg: Message, shouldLog?: boolean, onDidWrite?: () => void) {
     if (!this._isClosed) {
       msg.sessionId = this.sessionId;
-      this.rootTransport.send(msg, shouldLog);
+      this.rootTransport.send(msg, shouldLog, onDidWrite);
     }
   }
 

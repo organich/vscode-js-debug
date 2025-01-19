@@ -3,12 +3,13 @@
  *--------------------------------------------------------*/
 
 import { inject, injectable } from 'inversify';
-import { IConsole } from '.';
 import Cdp from '../../cdp/api';
 import { assertNever } from '../../common/objUtils';
 import Dap from '../../dap/api';
 import { IDapApi } from '../../dap/connection';
+import { IShutdownParticipants, ShutdownOrder } from '../../ui/shutdownParticipants';
 import { Thread } from '../threads';
+import { IConsole } from '.';
 import { ClearMessage, EndGroupMessage, IConsoleMessage } from './consoleMessage';
 import { ReservationQueue } from './reservationQueue';
 import {
@@ -45,7 +46,19 @@ export class Console implements IConsole {
     return this.queue.length;
   }
 
-  constructor(@inject(IDapApi) private readonly dap: Dap.Api) {}
+  constructor(
+    @inject(IDapApi) private readonly dap: Dap.Api,
+    @inject(IShutdownParticipants) shutdown: IShutdownParticipants,
+  ) {
+    shutdown.register(ShutdownOrder.ExecutionContexts, async final => {
+      if (this.length) {
+        await new Promise(r => this.onDrained(r));
+      }
+      if (final) {
+        this.dispose();
+      }
+    });
+  }
 
   /**
    * @inheritdoc
@@ -88,9 +101,9 @@ export class Console implements IConsole {
       // See: https://github.com/nodejs/node/issues/31973
       const firstFrame = event.stackTrace?.callFrames[0];
       if (
-        firstFrame &&
-        firstFrame.url === 'internal/console/constructor.js' &&
-        duplicateNodeJsLogFunctions.has(firstFrame.functionName)
+        firstFrame
+        && firstFrame.url === 'internal/console/constructor.js'
+        && duplicateNodeJsLogFunctions.has(firstFrame.functionName)
       ) {
         return;
       }

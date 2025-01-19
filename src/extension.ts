@@ -2,6 +2,7 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { tmpdir } from 'os';
 import * as vscode from 'vscode';
 import {
@@ -26,20 +27,24 @@ import { attachProcess, pickProcess } from './ui/processPicker';
 import { registerProfilingCommand } from './ui/profiling';
 import { registerRequestCDPProxy } from './ui/requestCDPProxy';
 import { registerRevealPage } from './ui/revealPage';
-import { TerminalLinkHandler } from './ui/terminalLinkHandler';
 import { toggleSkippingFile } from './ui/toggleSkippingFile';
 import { VSCodeSessionManager } from './ui/vsCodeSessionManager';
 
 export function activate(context: vscode.ExtensionContext) {
+  if (vscode.l10n.bundle) {
+    l10n.config({ contents: vscode.l10n.bundle });
+  }
+
   const services = createGlobalContainer({
     // On Windows, use the os.tmpdir() since the extension storage path is too long. See:
     // https://github.com/microsoft/vscode-js-debug/issues/342
-    storagePath:
-      process.platform === 'win32' ? tmpdir() : context.storagePath || context.extensionPath,
+    storagePath: process.platform === 'win32'
+      ? tmpdir()
+      : context.storagePath || context.extensionPath,
     isVsCode: true,
-    isRemote:
-      !!process.env.JS_DEBUG_USE_COMPANION ||
-      vscode.extensions.getExtension(extensionId)?.extensionKind === vscode.ExtensionKind.Workspace,
+    isRemote: !!process.env.JS_DEBUG_USE_COMPANION
+      || vscode.extensions.getExtension(extensionId)?.extensionKind
+        === vscode.ExtensionKind.Workspace,
     context,
   });
 
@@ -59,7 +64,9 @@ export function activate(context: vscode.ExtensionContext) {
 
     const preferred = preferredDebugTypes.get(resolver.type as DebugType);
     if (preferred) {
-      context.subscriptions.push(vscode.debug.registerDebugConfigurationProvider(preferred, cast));
+      context.subscriptions.push(
+        vscode.debug.registerDebugConfigurationProvider(preferred, cast),
+      );
     }
   }
 
@@ -75,7 +82,7 @@ export function activate(context: vscode.ExtensionContext) {
   const sessionManager = new VSCodeSessionManager(services);
   context.subscriptions.push(
     ...[...allDebugTypes].map(type =>
-      vscode.debug.registerDebugAdapterDescriptorFactory(type, sessionManager),
+      vscode.debug.registerDebugAdapterDescriptorFactory(type, sessionManager)
     ),
   );
   context.subscriptions.push(
@@ -88,12 +95,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   registerCompanionBrowserLaunch(context);
   registerCustomBreakpointsUI(context, debugSessionTracker);
-  registerDebugTerminalUI(
-    context,
-    services.get(DelegateLauncherFactory),
-    services.get(TerminalLinkHandler),
-    services,
-  );
+  registerDebugTerminalUI(context, services.get(DelegateLauncherFactory), services);
   registerProfilingCommand(context, services);
   registerAutoAttach(context, services.get(DelegateLauncherFactory), services);
   registerRevealPage(context, debugSessionTracker);

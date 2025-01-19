@@ -3,28 +3,36 @@
  *--------------------------------------------------------*/
 
 import {
-  BasicSourceMapConsumer,
-  IndexedSourceMapConsumer,
-  MappedPosition,
-  MappingItem,
-  NullableMappedPosition,
-  NullablePosition,
-  Position,
-  SourceMapConsumer,
-} from 'source-map';
+  allGeneratedPositionsFor,
+  decodedMappings,
+  EachMapping,
+  eachMapping,
+  GeneratedMapping,
+  generatedPositionFor,
+  GREATEST_LOWER_BOUND,
+  InvalidGeneratedMapping,
+  InvalidOriginalMapping,
+  OriginalMapping,
+  originalPositionFor,
+  TraceMap,
+} from '@jridgewell/trace-mapping';
+import { SourceNeedle } from '@jridgewell/trace-mapping/dist/types/types';
 import { fixDriveLetterAndSlashes } from '../pathUtils';
 import { completeUrlEscapingRoot, isDataUri } from '../urlUtils';
 
 export interface ISourceMapMetadata {
   sourceMapUrl: string;
-  cacheKey?: number;
+  cacheKey?: number | string;
   compiledPath: string;
 }
+
+export type NullableMappedPosition = InvalidOriginalMapping | OriginalMapping;
+export type NullableGeneratedPosition = InvalidGeneratedMapping | GeneratedMapping;
 
 /**
  * Wrapper for a parsed sourcemap.
  */
-export class SourceMap implements SourceMapConsumer {
+export class SourceMap {
   private static idCounter = 0;
 
   /**
@@ -39,10 +47,10 @@ export class SourceMap implements SourceMapConsumer {
   public readonly id = SourceMap.idCounter++;
 
   constructor(
-    private readonly original: BasicSourceMapConsumer | IndexedSourceMapConsumer,
+    private readonly original: TraceMap,
     public readonly metadata: Readonly<ISourceMapMetadata>,
     private readonly actualRoot: string,
-    public readonly actualSources: ReadonlyArray<string>,
+    public readonly actualSources: ReadonlyArray<string | null>,
     public readonly hasNames: boolean,
   ) {
     if (actualSources.length !== original.sources.length) {
@@ -50,8 +58,12 @@ export class SourceMap implements SourceMapConsumer {
     }
 
     for (let i = 0; i < actualSources.length; i++) {
-      this.sourceActualToOriginal.set(actualSources[i], original.sources[i]);
-      this.sourceOriginalToActual.set(original.sources[i], actualSources[i]);
+      const a = actualSources[i];
+      const o = original.sources[i];
+      if (a !== null && o !== null) {
+        this.sourceActualToOriginal.set(a, o);
+        this.sourceOriginalToActual.set(o, a);
+      }
     }
   }
 
@@ -91,17 +103,12 @@ export class SourceMap implements SourceMapConsumer {
   /**
    * @inheritdoc
    */
-  computeColumnSpans(): void {
-    this.original.computeColumnSpans();
-  }
-
-  /**
-   * @inheritdoc
-   */
-  originalPositionFor(
-    generatedPosition: Position & { bias?: number | undefined },
-  ): NullableMappedPosition {
-    const mapped = this.original.originalPositionFor(generatedPosition);
+  originalPositionFor(generatedPosition: {
+    line: number;
+    column: number;
+    bias?: 1 | -1;
+  }): NullableMappedPosition {
+    const mapped = originalPositionFor(this.original, generatedPosition);
     if (mapped.source) {
       mapped.source = this.sourceOriginalToActual.get(mapped.source) ?? mapped.source;
     }
@@ -112,10 +119,32 @@ export class SourceMap implements SourceMapConsumer {
   /**
    * @inheritdoc
    */
-  generatedPositionFor(
-    originalPosition: MappedPosition & { bias?: number | undefined },
-  ): NullablePosition {
-    return this.original.generatedPositionFor({
+  generatedPositionFor(originalPosition: {
+    line: number;
+    column: number;
+    bias?: 1 | -1;
+    source: string;
+  }): NullableGeneratedPosition {
+    const source = this.sourceActualToOriginal.get(originalPosition.source)
+      ?? originalPosition.source;
+
+    // For non-finite lines, get the any closest location to the desired bounds
+    if (!isFinite(originalPosition.line)) {
+      const bias = originalPosition.bias || GREATEST_LOWER_BOUND;
+      return this.getBestGeneratedForOriginal(
+        source,
+        (a, b) => sortOriginalLocationAscending(a, b) * bias,
+      );
+    }
+
+    return generatedPositionFor(this.original, { ...originalPosition, source });
+  }
+
+  /**
+   * @inheritdoc
+   */
+  allGeneratedPositionsFor(originalPosition: SourceNeedle): GeneratedMapping[] {
+    return allGeneratedPositionsFor(this.original, {
       ...originalPosition,
       source: this.sourceActualToOriginal.get(originalPosition.source) ?? originalPosition.source,
     });
@@ -124,45 +153,44 @@ export class SourceMap implements SourceMapConsumer {
   /**
    * @inheritdoc
    */
-  allGeneratedPositionsFor(originalPosition: MappedPosition): NullablePosition[] {
-    return this.original.allGeneratedPositionsFor({
-      ...originalPosition,
-      source: this.sourceActualToOriginal.get(originalPosition.source) ?? originalPosition.source,
+  sourceContentFor(source: string): string | null {
+    source = this.sourceActualToOriginal.get(source) ?? source;
+    const index = this.original.sources.indexOf(source);
+    return index === -1 ? null : this.original.sourcesContent?.[index] ?? null;
+  }
+
+  eachMapping(callback: (mapping: EachMapping) => void): void {
+    eachMapping(this.original, callback);
+  }
+
+  /** Gets internal decoded mappings from the sourcemap. */
+  decodedMappings() {
+    return decodedMappings(this.original);
+  }
+
+  /** Gets internal decoded names from the sourcemap. */
+  names() {
+    return this.original.names;
+  }
+
+  private getBestGeneratedForOriginal(
+    source: string,
+    picker: (is: EachMapping, betterThan: EachMapping) => number,
+  ): NullableGeneratedPosition {
+    let best: EachMapping | undefined;
+    this.eachMapping(mapping => {
+      if (mapping.source === source && (!best || picker(mapping, best) > 0)) {
+        best = mapping;
+      }
     });
-  }
 
-  /**
-   * @inheritdoc
-   */
-  hasContentsOfAllSources(): boolean {
-    return this.original.hasContentsOfAllSources();
-  }
-
-  /**
-   * @inheritdoc
-   */
-  sourceContentFor(source: string, returnNullOnMissing?: boolean | undefined): string | null {
-    return this.original.sourceContentFor(
-      this.sourceActualToOriginal.get(source) ?? source,
-      returnNullOnMissing,
-    );
-  }
-
-  /**
-   * @inheritdoc
-   */
-  eachMapping<ThisArg = void>(
-    callback: (this: ThisArg, mapping: MappingItem) => void,
-    context?: ThisArg,
-    order?: number | undefined,
-  ): void {
-    return this.original.eachMapping(callback, context, order);
-  }
-
-  /**
-   * @inheritdoc
-   */
-  destroy(): void {
-    this.original.destroy();
+    return best
+      ? { column: best.generatedColumn, line: best.generatedLine }
+      : { column: null, line: null };
   }
 }
+
+const sortOriginalLocationAscending = (
+  { originalLine: l1, originalColumn: c1 }: EachMapping,
+  { originalLine: l2, originalColumn: c2 }: EachMapping,
+) => (l1 || 0) - (l2 || 0) || (c1 || 0) - (c2 || 0);

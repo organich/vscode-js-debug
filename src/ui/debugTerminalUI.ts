@@ -2,10 +2,10 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { Container } from 'inversify';
 import { homedir } from 'os';
 import * as vscode from 'vscode';
-import * as nls from 'vscode-nls';
 import { IPortLeaseTracker } from '../adapter/portLeaseTracker';
 import { NeverCancelled } from '../common/cancellation';
 import {
@@ -17,6 +17,7 @@ import {
 } from '../common/contributionUtils';
 import { EventEmitter } from '../common/events';
 import { ProxyLogger } from '../common/logging/proxyLogger';
+import { ITerminalLinkProvider } from '../common/terminalLinkProvider';
 import {
   applyDefaults,
   ITerminalLaunchConfiguration,
@@ -32,9 +33,6 @@ import { NodeOnlyPathResolverFactory } from '../targets/sourcePathResolverFactor
 import { MutableTargetOrigin } from '../targets/targetOrigin';
 import { ITarget } from '../targets/targets';
 import { DapTelemetryReporter } from '../telemetry/dapTelemetryReporter';
-import { TerminalLinkHandler } from './terminalLinkHandler';
-
-const localize = nls.loadMessageBundle();
 
 export const launchVirtualTerminalParent = (
   delegate: DelegateLauncherFactory,
@@ -96,19 +94,19 @@ export const launchVirtualTerminalParent = (
       // Skip targets the consumer asked to filter out.
       if (!filterTarget(target)) {
         target.detach();
-        return;
+        continue;
       }
 
       // Check that we didn't detach from the parent session.
       if (target.targetInfo.openerId && !target.parent()) {
         target.detach();
-        return;
+        continue;
       }
 
       // Detach from targets if workspace trust was not granted
       if (!trusted) {
         target.detach();
-        return;
+        continue;
       }
 
       if (!target.parent()) {
@@ -158,10 +156,9 @@ export const launchVirtualTerminalParent = (
 const Abort = Symbol('Abort');
 
 const home = homedir();
-const tildify: (s: string) => string =
-  process.platform === 'win32'
-    ? s => s
-    : s => (s.startsWith(home) ? `~${s.slice(home.length)}` : s);
+const tildify: (s: string) => string = process.platform === 'win32'
+  ? s => s
+  : s => (s.startsWith(home) ? `~${s.slice(home.length)}` : s);
 
 async function getWorkspaceFolder() {
   const folders = vscode.workspace.workspaceFolders;
@@ -176,10 +173,7 @@ async function getWorkspaceFolder() {
       folder,
     })),
     {
-      placeHolder: localize(
-        'terminal.cwdpick',
-        'Select current working directory for new terminal',
-      ),
+      placeHolder: l10n.t('Select current working directory for new terminal'),
     },
   );
 
@@ -208,7 +202,6 @@ class ProfileTerminalLauncher extends TerminalNodeLauncher {
 export function registerDebugTerminalUI(
   context: vscode.ExtensionContext,
   delegateFactory: DelegateLauncherFactory,
-  linkHandler: TerminalLinkHandler,
   services: Container,
 ) {
   const terminals = new Map<
@@ -223,6 +216,7 @@ export function registerDebugTerminalUI(
       services.get(FS),
       services.get(NodeOnlyPathResolverFactory),
       services.get(IPortLeaseTracker),
+      services.get(ITerminalLinkProvider),
     );
 
   /**
@@ -249,9 +243,9 @@ export function registerDebugTerminalUI(
     if (command) {
       for (const [terminal, config] of terminals) {
         if (
-          config.folder === workspaceFolder &&
-          config.cwd === defaultConfig?.cwd &&
-          !config.launcher.targetList().length
+          config.folder === workspaceFolder
+          && config.cwd === defaultConfig?.cwd
+          && !config.launcher.targetList().length
         ) {
           terminal.show(true);
           terminal.sendText(command);
@@ -268,7 +262,6 @@ export function registerDebugTerminalUI(
 
     launcher.onTerminalCreated(terminal => {
       terminals.set(terminal, { launcher, folder: workspaceFolder, cwd: defaultConfig?.cwd });
-      linkHandler.enableHandlingInTerminal(terminal);
     });
 
     try {
@@ -298,8 +291,10 @@ export function registerDebugTerminalUI(
     vscode.window.onDidCloseTerminal(terminal => {
       terminals.delete(terminal);
     }),
-    registerCommand(vscode.commands, Commands.CreateDebuggerTerminal, (command, folder, config) =>
-      launchTerminal(delegateFactory, command, folder, config),
+    registerCommand(
+      vscode.commands,
+      Commands.CreateDebuggerTerminal,
+      (command, folder, config) => launchTerminal(delegateFactory, command, folder, config),
     ),
     vscode.window.registerTerminalProfileProvider('extension.js-debug.debugTerminal', {
       provideTerminalProfile: () =>
@@ -311,14 +306,14 @@ export function registerDebugTerminalUI(
               services.get(FS),
               services.get(NodeOnlyPathResolverFactory),
               services.get(IPortLeaseTracker),
+              services.get(ITerminalLinkProvider),
             );
 
             launcher.onOptionsReady(options => resolve(new vscode.TerminalProfile(options)));
 
             return launcher;
-          }),
+          })
         ),
     }),
-    vscode.window.registerTerminalLinkProvider?.(linkHandler),
   );
 }

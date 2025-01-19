@@ -5,7 +5,7 @@
 import { inject, injectable } from 'inversify';
 import Cdp from '../cdp/api';
 import { ILogger, LogTag } from '../common/logging';
-import { bisectArray } from '../common/objUtils';
+import { bisectArrayAsync, flatten } from '../common/objUtils';
 import { IPosition } from '../common/positions';
 import { delay } from '../common/promiseUtil';
 import { SourceMap } from '../common/sourceMaps/sourceMap';
@@ -25,18 +25,9 @@ import { NeverResolvedBreakpoint } from './breakpoints/neverResolvedBreakpoint';
 import { PatternEntryBreakpoint } from './breakpoints/patternEntrypointBreakpoint';
 import { UserDefinedBreakpoint } from './breakpoints/userDefinedBreakpoint';
 import { DiagnosticToolSuggester } from './diagnosticToolSuggester';
-import {
-  base0To1,
-  base1To0,
-  ISourceWithMap,
-  isSourceWithMap,
-  IUiLocation,
-  rawToUiOffset,
-  Source,
-  SourceContainer,
-  uiToRawOffset,
-} from './sources';
-import { Script, ScriptWithSourceMapHandler, Thread } from './threads';
+import { base0To1, base1To0, ISourceWithMap, isSourceWithMap, IUiLocation, Source } from './source';
+import { SourceContainer } from './sourceContainer';
+import { ScriptWithSourceMapHandler, Thread } from './threads';
 
 /**
  * Differential result used internally in setBreakpoints.
@@ -143,8 +134,8 @@ export class BreakpointManager {
     @inject(SourceContainer) sourceContainer: SourceContainer,
     @inject(ILogger) public readonly logger: ILogger,
     @inject(AnyLaunchConfiguration) private readonly launchConfig: AnyLaunchConfiguration,
-    @inject(IBreakpointConditionFactory)
-    private readonly conditionFactory: IBreakpointConditionFactory,
+    @inject(IBreakpointConditionFactory) private readonly conditionFactory:
+      IBreakpointConditionFactory,
     @inject(DiagnosticToolSuggester) private readonly suggester: DiagnosticToolSuggester,
     @inject(IBreakpointsPredictor) public readonly _breakpointsPredictor?: IBreakpointsPredictor,
   ) {
@@ -152,6 +143,17 @@ export class BreakpointManager {
     this._sourceContainer = sourceContainer;
 
     _breakpointsPredictor?.onLongParse(() => dap.longPrediction({}));
+
+    sourceContainer.onScript(script => {
+      script.source.then(source => {
+        const thread = this._thread;
+        if (thread) {
+          this._byRef
+            .get(source.sourceReference)
+            ?.forEach(bp => bp.updateForNewLocations(thread, script));
+        }
+      });
+    });
 
     sourceContainer.onSourceMappedSteppingChange(() => {
       if (this._thread) {
@@ -181,11 +183,13 @@ export class BreakpointManager {
         for (const source of queue[i]) {
           const path = source.absolutePath;
           const byPath = path ? this._byPath.get(path) : undefined;
-          for (const breakpoint of byPath || [])
-            todo.push(breakpoint.updateForSourceMap(this._thread, script));
+          for (const breakpoint of byPath || []) {
+            todo.push(breakpoint.updateForNewLocations(this._thread, script));
+          }
           const byRef = this._byRef.get(source.sourceReference);
-          for (const breakpoint of byRef || [])
-            todo.push(breakpoint.updateForSourceMap(this._thread, script));
+          for (const breakpoint of byRef || []) {
+            todo.push(breakpoint.updateForNewLocations(this._thread, script));
+          }
 
           if (source.sourceMap) {
             queue.push(source.sourceMap.sourceByUrl.values());
@@ -193,7 +197,7 @@ export class BreakpointManager {
         }
       }
 
-      return (await Promise.all(todo)).reduce((a, b) => [...a, ...b], []);
+      return flatten(await Promise.all(todo));
     };
   }
 
@@ -207,8 +211,8 @@ export class BreakpointManager {
       .concat(breakpointsAtSource)
       .some(
         bp =>
-          bp.originalPosition.columnNumber === location.columnNumber &&
-          bp.originalPosition.lineNumber === location.lineNumber,
+          bp.originalPosition.columnNumber === location.columnNumber
+          && bp.originalPosition.lineNumber === location.lineNumber,
       );
   }
 
@@ -217,23 +221,30 @@ export class BreakpointManager {
    * location in the `toSource`, using the provided source map. Breakpoints
    * are don't have a corresponding location won't be moved.
    */
-  public moveBreakpoints(fromSource: Source, sourceMap: SourceMap, toSource: Source) {
+  public async moveBreakpoints(
+    thread: Thread,
+    fromSource: Source,
+    sourceMap: SourceMap,
+    toSource: Source,
+  ) {
     const tryUpdateLocations = (breakpoints: UserDefinedBreakpoint[]) =>
-      bisectArray(breakpoints, bp => {
-        const gen = this._sourceContainer.getOptiminalOriginalPosition(
+      bisectArrayAsync(breakpoints, async bp => {
+        const gen = await this._sourceContainer.getOptiminalOriginalPosition(
           sourceMap,
           bp.originalPosition,
         );
-        if (gen.column === null || gen.line === null) {
+        if (!gen) {
           return false;
         }
 
+        const base1 = gen.position.base1;
         bp.updateSourceLocation(
+          thread,
           {
             path: toSource.absolutePath,
             sourceReference: toSource.sourceReference,
           },
-          { lineNumber: gen.line, columnNumber: gen.column + 1, source: toSource },
+          { lineNumber: base1.lineNumber, columnNumber: base1.columnNumber, source: toSource },
         );
         return false;
       });
@@ -242,14 +253,14 @@ export class BreakpointManager {
     const toPath = toSource.absolutePath;
     const byPath = fromPath ? this._byPath.get(fromPath) : undefined;
     if (byPath && toPath) {
-      const [remaining, moved] = tryUpdateLocations(byPath);
+      const [remaining, moved] = await tryUpdateLocations(byPath);
       this._byPath.set(fromPath, remaining);
       this._byPath.set(toPath, moved);
     }
 
     const byRef = this._byRef.get(fromSource.sourceReference);
     if (byRef) {
-      const [remaining, moved] = tryUpdateLocations(byRef);
+      const [remaining, moved] = await tryUpdateLocations(byRef);
       this._byRef.set(fromSource.sourceReference, remaining);
       this._byRef.set(toSource.sourceReference, moved);
     }
@@ -293,7 +304,7 @@ export class BreakpointManager {
 
     await Promise.all(
       [...this._byDapId.values()].map(bp =>
-        this._enabledFilter(bp) ? bp.enable(thread) : bp.disable(),
+        this._enabledFilter(bp) ? bp.enable(thread) : bp.disable()
       ),
     );
   }
@@ -308,18 +319,19 @@ export class BreakpointManager {
     end: IPosition,
   ) {
     const start1 = start.base1;
-    const startLocations = this._sourceContainer.currentSiblingUiLocations({
-      source,
-      lineNumber: start1.lineNumber,
-      columnNumber: start1.columnNumber,
-    });
-
     const end1 = end.base1;
-    const endLocations = this._sourceContainer.currentSiblingUiLocations({
-      source,
-      lineNumber: end1.lineNumber,
-      columnNumber: end1.columnNumber,
-    });
+    const [startLocations, endLocations] = await Promise.all([
+      this._sourceContainer.currentSiblingUiLocations({
+        source,
+        lineNumber: start1.lineNumber,
+        columnNumber: start1.columnNumber,
+      }),
+      this._sourceContainer.currentSiblingUiLocations({
+        source,
+        lineNumber: end1.lineNumber,
+        columnNumber: end1.columnNumber,
+      }),
+    ]);
 
     // As far as I know the number of start and end locations should be the
     // same, log if this is not the case.
@@ -334,7 +346,7 @@ export class BreakpointManager {
     // For each viable location, attempt to identify its script ID and then ask
     // Chrome for the breakpoints in the given range. For almost all scripts
     // we'll only every find one viable location with a script.
-    const todo: Promise<void>[] = [];
+    const todo: Promise<unknown>[] = [];
     const result: IPossibleBreakLocation[] = [];
     for (let i = 0; i < startLocations.length; i++) {
       const start = startLocations[i];
@@ -348,26 +360,26 @@ export class BreakpointManager {
         continue;
       }
 
-      // Only take the first script that matches this source. The breakpoints
+      // Only take the last script that matches this source. The breakpoints
       // are all coming from the same source code, so possible breakpoints
       // at one location where this source is present should match every other.
       const lsrc = start.source;
-      const scripts = thread.scriptsFromSource(lsrc);
-      if (scripts.size === 0) {
+      if (!lsrc.scripts.length) {
         continue;
       }
 
-      const { scriptId } = scripts.values().next().value as Script;
+      const { scriptId } = lsrc.scripts[lsrc.scripts.length - 1];
       todo.push(
         thread
           .cdp()
           .Debugger.getPossibleBreakpoints({
             restrictToFunction: false,
-            start: { scriptId, ...uiToRawOffset(base1To0(start), lsrc.runtimeScriptOffset) },
-            end: { scriptId, ...uiToRawOffset(base1To0(end), lsrc.runtimeScriptOffset) },
+            start: { scriptId, ...lsrc.offsetSourceToScript(base1To0(start)) },
+            end: { scriptId, ...lsrc.offsetSourceToScript(base1To0(end)) },
           })
           .then(r => {
-            if (!r) {
+            // locations can be undefined in Hermes, #1837
+            if (!r?.locations) {
               return;
             }
 
@@ -375,15 +387,17 @@ export class BreakpointManager {
             // Discard any that map outside of the source we're interested in,
             // which is possible (e.g. if a section of code from one source is
             // inlined amongst the range we request).
-            for (const breakLocation of r.locations) {
-              const { lineNumber, columnNumber = 0 } = breakLocation;
-              const uiLocations = this._sourceContainer.currentSiblingUiLocations({
-                source: lsrc,
-                ...rawToUiOffset(base0To1({ lineNumber, columnNumber }), lsrc.runtimeScriptOffset),
-              });
+            return Promise.all(
+              r.locations.map(async breakLocation => {
+                const { lineNumber, columnNumber = 0 } = breakLocation;
+                const uiLocations = await this._sourceContainer.currentSiblingUiLocations({
+                  source: lsrc,
+                  ...lsrc.offsetScriptToSource(base0To1({ lineNumber, columnNumber })),
+                });
 
-              result.push({ breakLocation, uiLocations });
-            }
+                result.push({ breakLocation, uiLocations });
+              }),
+            );
           }),
       );
     }
@@ -426,8 +440,8 @@ export class BreakpointManager {
     }
 
     if (
-      'runtimeSourcemapPausePatterns' in this.launchConfig &&
-      this.launchConfig.runtimeSourcemapPausePatterns.length
+      'runtimeSourcemapPausePatterns' in this.launchConfig
+      && this.launchConfig.runtimeSourcemapPausePatterns.length
     ) {
       this.setRuntimeSourcemapPausePatterns(
         thread,
@@ -456,7 +470,7 @@ export class BreakpointManager {
   private setRuntimeSourcemapPausePatterns(thread: Thread, patterns: ReadonlyArray<string>) {
     return Promise.all(
       patterns.map(pattern =>
-        this._setBreakpoint(new PatternEntryBreakpoint(this, pattern), thread),
+        this._setBreakpoint(new PatternEntryBreakpoint(this, pattern), thread)
       ),
     );
   }
@@ -476,16 +490,18 @@ export class BreakpointManager {
     const perScriptSm =
       (this.launchConfig as IChromiumBaseConfiguration).perScriptSourcemaps === 'yes';
 
+    let entryBpSet: Promise<boolean>;
     if (perScriptSm) {
-      return Promise.all([
+      entryBpSet = Promise.all([
         this.updateEntryBreakpointMode(thread, EntryBreakpointMode.Greedy),
         thread.setScriptSourceMapHandler(false, this._scriptSourceMapHandler),
       ]).then(() => true);
     } else if (this._breakpointsPredictor && !this.launchConfig.pauseForSourceMap) {
-      return thread.setScriptSourceMapHandler(false, this._scriptSourceMapHandler);
+      entryBpSet = thread.setScriptSourceMapHandler(false, this._scriptSourceMapHandler);
     } else {
-      return thread.setScriptSourceMapHandler(true, this._scriptSourceMapHandler);
+      entryBpSet = thread.setScriptSourceMapHandler(true, this._scriptSourceMapHandler);
     }
+    this._sourceMapHandlerInstalled = { entryBpSet };
   }
 
   private async _uninstallSourceMapHandler(thread: Thread) {
@@ -506,24 +522,12 @@ export class BreakpointManager {
     ids: number[],
   ): Promise<Dap.SetBreakpointsResult> {
     if (!this._sourceMapHandlerInstalled && this._thread && params.breakpoints?.length) {
-      this._sourceMapHandlerInstalled = { entryBpSet: this._installSourceMapHandler(this._thread) };
+      this._installSourceMapHandler(this._thread);
     }
 
     const wasEntryBpSet = await this._sourceMapHandlerInstalled?.entryBpSet;
     params.source.path = urlUtils.platformPathToPreferredCase(params.source.path);
-
-    // If we see we want to set breakpoints in file by source reference ID but
-    // it doesn't exist, they were probably from a previous section. The
-    // references for scripts just auto-increment per session and are entirely
-    // ephemeral. Remove the reference so that we fall back to a path if possible.
     const containedSource = this._sourceContainer.source(params.source);
-    if (
-      params.source.sourceReference /* not (undefined or 0=on disk) */ &&
-      params.source.path &&
-      !containedSource
-    ) {
-      params.source.sourceReference = undefined;
-    }
 
     // Wait until the breakpoint predictor finishes to be sure that we
     // can place correctly in breakpoint.set(), if:
@@ -590,18 +594,26 @@ export class BreakpointManager {
     };
 
     const getCurrent = () =>
-      params.source.path
-        ? this._byPath.get(params.source.path)
-        : params.source.sourceReference
+      params.source.sourceReference
         ? this._byRef.get(params.source.sourceReference)
+        : params.source.path
+        ? this._byPath.get(params.source.path)
         : undefined;
 
     const result = mergeInto(getCurrent() ?? []);
-    if (params.source.path) {
-      this._byPath.set(params.source.path, result.list);
-    } else if (params.source.sourceReference) {
+    if (params.source.sourceReference) {
       this._byRef.set(params.source.sourceReference, result.list);
+    } else if (params.source.path) {
+      this._byPath.set(params.source.path, result.list);
     } else {
+      return { breakpoints: [] };
+    }
+
+    // Ignore no-op breakpoint sets. These can come in from VS Code at the start
+    // of the session (if a file only has disabled breakpoints) and make it look
+    // like the user had removed all breakpoints they previously set, causing
+    // us to uninstall/re-install the SM handler repeatedly.
+    if (result.unbound.length === 0 && result.new.length === 0) {
       return { breakpoints: [] };
     }
 
@@ -610,14 +622,18 @@ export class BreakpointManager {
     await Promise.all(
       result.unbound.map(b => {
         this._byDapId.delete(b.dapId);
-        b.disable();
+        return b.disable();
       }),
     );
 
     this._totalBreakpointsCount += result.new.length;
 
-    if (this._thread && this._totalBreakpointsCount === 0 && this._sourceMapHandlerInstalled) {
-      this._uninstallSourceMapHandler(this._thread);
+    if (this._thread) {
+      if (this._totalBreakpointsCount === 0 && this._sourceMapHandlerInstalled) {
+        this._uninstallSourceMapHandler(this._thread);
+      } else if (this._totalBreakpointsCount > 0 && !this._sourceMapHandlerInstalled) {
+        this._installSourceMapHandler(this._thread);
+      }
     }
 
     if (thread && result.new.length) {
@@ -675,7 +691,7 @@ export class BreakpointManager {
   }
 
   /**
-   * Rreturns whether any of the given breakpoints are an entrypoint breakpoint.
+   * Returns whether any of the given breakpoints are an entrypoint breakpoint.
    */
   public isEntrypointBreak(
     hitBreakpointIds: ReadonlyArray<Cdp.Debugger.BreakpointId>,
@@ -684,17 +700,11 @@ export class BreakpointManager {
     // Fix: if we stopped in a script where an active entrypoint breakpoint
     // exists, regardless of the reason, treat this as a breakpoint.
     // ref: https://github.com/microsoft/vscode/issues/107859
-    const entryInScript = [...this.moduleEntryBreakpoints.values()].filter(
+    const entryInScript = [...this.moduleEntryBreakpoints.values()].some(
       bp => bp.enabled && bp.cdpScriptIds.has(scriptId),
     );
 
-    if (entryInScript.length) {
-      for (const breakpoint of entryInScript) {
-        if (!(breakpoint instanceof PatternEntryBreakpoint)) {
-          breakpoint.disable();
-        }
-      }
-
+    if (entryInScript) {
       return true;
     }
 
@@ -702,6 +712,12 @@ export class BreakpointManager {
       const bp = this._resolvedBreakpoints.get(id);
       return bp && (bp instanceof EntryBreakpoint || isSetAtEntry(bp));
     });
+  }
+
+  /** Gets whether the CDP breakpoint ID refers to an entrypoint breakpoint. */
+  public isEntrypointCdpBreak(cdpId: string) {
+    const bp = this._resolvedBreakpoints.get(cdpId);
+    return bp instanceof EntryBreakpoint;
   }
 
   /**
@@ -737,8 +753,8 @@ export class BreakpointManager {
           // an indicator that it did exist and was hit, so that if further
           // breakpoints are set in the file it doesn't get re-applied.
           if (
-            this.entryBreakpointMode === EntryBreakpointMode.Exact &&
-            !(breakpoint instanceof PatternEntryBreakpoint)
+            this.entryBreakpointMode === EntryBreakpointMode.Exact
+            && !(breakpoint instanceof PatternEntryBreakpoint)
           ) {
             breakpoint.disable();
           }

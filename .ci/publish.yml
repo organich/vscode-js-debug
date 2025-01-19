@@ -1,6 +1,4 @@
-trigger:
-  tags:
-    include: ['*']
+trigger: none
 pr: none
 
 resources:
@@ -16,20 +14,52 @@ parameters:
     displayName: 🚀 Publish Extension
     type: boolean
     default: false
+  - name: publishGhRelease
+    displayName: ☁️ Publish Github release
+    type: boolean
+    default: true
 
 extends:
   template: azure-pipelines/extension/stable.yml@templates
   parameters:
-    workingDirectory: dist
     publishExtension: ${{ parameters.publishExtension }}
     vscePackageArgs: --no-dependencies
-    cgIgnoreDirectories: 'testdata,demos,.vscode-test'
-    ghCreateRelease: true
-    ghReleaseAddChangeLog: true
-    l10nShouldProcess: false
+    apiScanExcludes: '**/w32appcontainertokens-*.node'
+    cgIgnoreDirectories: 'testdata,demos,.vscode-test,src/test,testWorkspace'
+    ${{ if eq(parameters.publishGhRelease, true) }}:
+      ghCreateRelease: true
+      ghReleaseAddChangeLog: true
+    l10nShouldOnlyPush: true
+    l10nPackageNlsPath: package.nls.json
+    l10nSourcePaths: src
     buildSteps:
-      - script: npm install
+      - script: npm install --legacy-peer-deps
         displayName: Install dependencies
 
-      - script: npm run compile -- package:prepare
+      - script: npm run compile -- dapDebugServer
+        displayName: Compile DAP Debug Server Bundle
+
+      - script: node src/build/archiveDapBundle $(Build.ArtifactStagingDirectory)/dap-server
+        displayName: Package DAP Debug Server Bundle
+
+      - script: mkdir $(Build.ArtifactStagingDirectory)/sbom-dap-server
+        condition: ${{ eq(parameters.publishExtension, true) }}
+        displayName: Create SBOM drop path
+
+      - task: 1ES.PublishPipelineArtifact@1
+        inputs:
+          artifactName: 'Publish DAP Debug Server Bundle'
+          sbomBuildComponentPath: $(Build.SourcesDirectory)/dist
+          sbomBuildDropPath: $(Build.ArtifactStagingDirectory)/sbom-dap-server
+          sbomEnabled: ${{ eq(parameters.publishExtension, true) }}
+          targetPath: $(Build.ArtifactStagingDirectory)/dap-server
+        displayName: Publish DAP Debug Server Bundle
+
+      - script: npm run compile -- package:hoist
         displayName: Package Stable
+    tsa:
+      config:
+        areaPath: 'Visual Studio Code Debugging Extensions'
+        serviceTreeID: '053e3ba6-924d-456c-ace0-67812c5ccc52'
+      enabled: true
+    apiScanSoftwareVersion: '1'

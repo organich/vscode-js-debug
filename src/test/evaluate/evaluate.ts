@@ -54,6 +54,11 @@ describe('evaluate', () => {
     await p.logger.evaluateAndLog(`Object.create({ get foo() { throw 'wat'; } })`, { depth: 2 });
     p.log('');
 
+    await p.logger.evaluateAndLog(`Object.create({ get [Symbol.toStringTag]() { return 42 } })`, {
+      depth: 2,
+    });
+    p.log('');
+
     p.evaluate(`setTimeout(() => { throw new Error('bar')}, 0)`);
     await p.logger.logOutput(await p.dap.once('output'));
     p.log('');
@@ -74,6 +79,15 @@ describe('evaluate', () => {
     await p.logger.logOutput(await p.dap.once('output'));
     p.log('');
 
+    p.assertLog();
+  });
+
+  itIntegrates('supports location lookup', async ({ r }) => {
+    const p = await r.launchUrlAndLoad('basic.html');
+    const fn = await p.logger.evaluateAndLog('printArr');
+    expect(fn.valueLocationReference).to.be.greaterThan(0);
+    const location = await p.dap.locations({ locationReference: fn.valueLocationReference! });
+    p.log(location);
     p.assertLog();
   });
 
@@ -171,7 +185,9 @@ describe('evaluate', () => {
     await p.logger.evaluateAndLog(`42`, { format });
     p.log('');
 
-    await p.logger.evaluateAndLog(`123567891235678912356789123567891235678912356789n`, { format });
+    await p.logger.evaluateAndLog(`123567891235678912356789123567891235678912356789n`, {
+      format,
+    });
     p.log('');
 
     await p.logger.evaluateAndLog(`'hello world'`, { format });
@@ -204,14 +220,16 @@ describe('evaluate', () => {
     "complex key": true,
   },
 }`,
-    [`{
+    [
+      `{
   double(x) {
     return x * 2;
   },
   triple: x => {
     return x * 3
   }
-}`]: `{
+}`
+    ]: `{
   double: function(x) {
     return x * 2;
   },
@@ -229,7 +247,8 @@ describe('evaluate', () => {
     'new Float32Array([1.5, 2.5, 3.5])': 'new Float32Array([1.5, 2.5, 3.5])',
     '1n << 100n': '1267650600228229401496703205376n',
     'new Date(1665007127286)': '"2022-10-05T21:58:47.286Z"',
-    '(() => { const node = document.createElement("div"); node.innerText = "hi"; return node })()': `<div>hi</div>`,
+    '(() => { const node = document.createElement("div"); node.innerText = "hi"; return node })()':
+      `<div>hi</div>`,
   };
 
   itIntegrates('copy via function', async ({ r }) => {
@@ -359,7 +378,7 @@ describe('evaluate', () => {
             'context=hover',
             "result: '1\\n2\\r3\\t\\\\4'",
             'context=repl',
-            "\nresult: '1\n2\r3\t\\4'",
+            "\nresult: '1\n2\r3\t\\\\4'",
             '',
           ].join('\n'),
         ),
@@ -449,10 +468,9 @@ describe('evaluate', () => {
 
     async function logCompletions(params: Dap.CompletionsParams) {
       const completions = await p.dap.completions(params);
-      const text =
-        params.text.substring(0, params.column - 1) +
-        '|' +
-        params.text.substring(params.column - 1);
+      const text = params.text.substring(0, params.column - 1)
+        + '|'
+        + params.text.substring(params.column - 1);
       p.log(
         completions.targets.filter(c => c.label.startsWith('cd')),
         `"${text}": `,
@@ -502,6 +520,40 @@ describe('evaluate', () => {
     await evaluateAtReturn('42');
     await evaluateAtReturn('{ a: { b: true } }');
     await evaluateAtReturn('undefined');
+    r.assertLog();
+  });
+
+  itIntegrates('shadowed variables', async ({ r }) => {
+    const p = await r.launchAndLoad('blank');
+
+    p.dap.evaluate({
+      expression: `(function () {
+          let foo = 1;
+          if (true) {
+              let foo = 2;
+              if (true) {
+                  let foo = 3;
+                  debugger;
+                  console.log(foo);
+              }
+          }
+        })();`,
+    });
+    const sourcePromise = p.dap.once('loadedSource');
+    const { threadId } = await p.dap.once('stopped');
+
+    const frameId = (
+      await p.dap.stackTrace({
+        threadId: threadId!,
+      })
+    ).stackFrames[0].id;
+    const { source } = await sourcePromise;
+    await p.logger.evaluateAndLog('foo', { params: { frameId } });
+    for (let line = 1; line <= 7; line++) {
+      p.log(`line ${line}:`);
+      await p.logger.evaluateAndLog('foo', { params: { frameId, line, column: 1, source } });
+    }
+
     r.assertLog();
   });
 

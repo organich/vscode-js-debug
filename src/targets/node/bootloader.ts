@@ -76,7 +76,9 @@ const jsDebugRegisteredToken = '$jsDebugIsRegistered';
     }
   } catch (e) {
     console.error(
-      `Error in the js-debug bootloader, please report to https://aka.ms/js-dbg-issue: ${e.stack}`,
+      `Error in the js-debug bootloader, please report to https://aka.ms/js-dbg-issue: ${
+        e.stack || e.message || e
+      }`,
     );
   }
 })();
@@ -161,6 +163,7 @@ function inspectOrQueue(env: IBootloaderInfo, ownId: string): boolean {
           NODE_SKIP_PLATFORM_CHECK: process.env.NODE_SKIP_PLATFORM_CHECK,
           NODE_INSPECTOR_INFO: JSON.stringify(info),
           NODE_INSPECTOR_IPC: env.inspectorIpc,
+          ELECTRON_RUN_AS_NODE: '1',
         },
       },
     );
@@ -266,7 +269,12 @@ function reportTelemetry(env: BootloaderEnvironment) {
     return;
   }
 
-  fs.writeFileSync(callbackFile, JSON.stringify(telemetry));
+  try {
+    fs.writeFileSync(callbackFile, JSON.stringify(telemetry));
+  } catch {
+    // ignored, #1797, debug could have torn down
+  }
+
   env.updateInspectorOption('fileCallback', undefined);
 }
 
@@ -278,6 +286,7 @@ function spawnWatchdog(execPath: string, watchdogInfo: IWatchdogInfo) {
     env: {
       NODE_INSPECTOR_INFO: JSON.stringify(watchdogInfo),
       NODE_SKIP_PLATFORM_CHECK: process.env.NODE_SKIP_PLATFORM_CHECK,
+      ELECTRON_RUN_AS_NODE: '1',
     },
     stdio: 'ignore',
     detached: true,

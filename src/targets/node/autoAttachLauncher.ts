@@ -2,6 +2,7 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { inject, injectable } from 'inversify';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -25,7 +26,6 @@ import {
   BootloaderEnvironment,
   IAutoAttachInfo,
   IBootloaderEnvironment,
-  variableDelimiter,
 } from './bootloader/environment';
 import { bootloaderDefaultPath, watchdogPath } from './bundlePaths';
 import { Capability, INodeBinaryProvider, NodeBinary } from './nodeBinaryProvider';
@@ -40,8 +40,7 @@ import { WatchDog } from './watchdogSpawn';
  * to create the 'server'.
  */
 @injectable()
-export class AutoAttachLauncher
-  extends NodeLauncherBase<ITerminalLaunchConfiguration>
+export class AutoAttachLauncher extends NodeLauncherBase<ITerminalLaunchConfiguration>
   implements ITerminalLauncherLike
 {
   private telemetryItems = new Map<number, IProcessTelemetry>();
@@ -143,19 +142,25 @@ export class AutoAttachLauncher
     const bootloaderEnv = debugVars.defined() as unknown as IBootloaderEnvironment;
 
     variables.persistent = true;
-    variables.prepend('NODE_OPTIONS', bootloaderEnv.NODE_OPTIONS + ' ');
-    variables.append(
-      'VSCODE_INSPECTOR_OPTIONS',
-      variableDelimiter + bootloaderEnv.VSCODE_INSPECTOR_OPTIONS,
+    variables.description = new vscode.MarkdownString(
+      l10n.t({
+        message: 'Enables Node.js [auto attach]({0}) debugging in "{1}" mode',
+        comment: ["{Locked='[auto attach]({0})'}", 'the 2nd placeholder is the setting value'],
+        args: [
+          'https://code.visualstudio.com/docs/nodejs/nodejs-debugging#_auto-attach',
+          autoAttachMode,
+        ],
+      }),
     );
+    variables.prepend('NODE_OPTIONS', bootloaderEnv.NODE_OPTIONS);
+    variables.append('VSCODE_INSPECTOR_OPTIONS', bootloaderEnv.VSCODE_INSPECTOR_OPTIONS);
   }
 
   private readSmartPatterns() {
     const configured = readConfig(vscode.workspace, Configuration.AutoAttachSmartPatterns);
-    const allFolders =
-      vscode.workspace.workspaceFolders?.length === 1
-        ? vscode.workspace.workspaceFolders[0].uri.fsPath
-        : `{${vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath).join(',')}}`;
+    const allFolders = vscode.workspace.workspaceFolders?.length === 1
+      ? vscode.workspace.workspaceFolders[0].uri.fsPath
+      : `{${vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath).join(',')}}`;
     return configured
       ?.map(c => c.replace('${workspaceFolder}', allFolders))
       .map(forceForwardSlashes);
@@ -172,8 +177,8 @@ export class AutoAttachLauncher
     //   return super.getBootloaderFile(cwd, binary);
     // }
 
-    const storagePath =
-      this.extensionContext.storagePath || this.extensionContext.globalStoragePath;
+    const storagePath = this.extensionContext.storagePath
+      || this.extensionContext.globalStoragePath;
     if (storagePath.includes(' ')) {
       if (binary.isPreciselyKnown && !binary.has(Capability.UseSpacesInRequirePath)) {
         throw new AutoAttachPreconditionFailed(
@@ -192,7 +197,7 @@ export class AutoAttachLauncher
 
     await Promise.all([
       copyFile(this.fs, bootloaderDefaultPath, bootloaderPath),
-      copyFile(this.fs, watchdogPath, path.join(storagePath, 'watchdog.bundle.js')),
+      copyFile(this.fs, watchdogPath, path.join(storagePath, 'watchdog.js')),
     ]);
 
     const p = forceForwardSlashes(bootloaderPath);

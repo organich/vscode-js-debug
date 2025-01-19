@@ -9,7 +9,7 @@ import { mapValues } from '../common/objUtils';
 import { ISourceMapMetadata } from '../common/sourceMaps/sourceMap';
 import { AnyLaunchConfiguration } from '../configuration';
 import Dap from '../dap/api';
-import { toolPath } from '../diagnosticTool';
+import { toolPath, toolStylePath } from '../diagnosticTool';
 import { FS, FsPromises } from '../ioc-extras';
 import { ITarget } from '../targets/targets';
 import { BreakpointManager } from './breakpoints';
@@ -18,7 +18,8 @@ import {
   IBreakpointCdpReferenceApplied,
   IBreakpointCdpReferencePending,
 } from './breakpoints/breakpointBase';
-import { IUiLocation, SourceContainer, SourceFromMap } from './sources';
+import { isSourceWithSourceMap, IUiLocation, SourceFromMap } from './source';
+import { SourceContainer } from './sourceContainer';
 
 export interface IDiagnosticSource {
   uniqueId: number;
@@ -45,8 +46,8 @@ export interface IDiagnosticUiLocation {
 export type DiagnosticBreakpointArgs =
   | Omit<IBreakpointCdpReferencePending, 'done'>
   | (Omit<IBreakpointCdpReferenceApplied, 'uiLocations'> & {
-      uiLocations: IDiagnosticUiLocation[];
-    });
+    uiLocations: IDiagnosticUiLocation[];
+  });
 
 export interface IDiagnosticBreakpoint {
   source: Dap.Source;
@@ -95,6 +96,7 @@ export class Diagnostics {
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Document</title>
+        <style>${await this.fs.readFile(toolStylePath, 'utf-8')}<</style>
       </head>
       <body>
         <script>window.DUMP=${JSON.stringify(await this.generateObject())}</script>
@@ -118,7 +120,7 @@ export class Diagnostics {
             cdp: dump.cdp.map(bp =>
               bp.state === CdpReferenceState.Applied
                 ? { ...bp, uiLocations: bp.uiLocations.map(l => this.dumpUiLocation(l)) }
-                : { ...bp, done: undefined },
+                : { ...bp, done: undefined }
             ),
           });
         }
@@ -139,22 +141,23 @@ export class Diagnostics {
           sourceReference: source.sourceReference,
           absolutePath: source.absolutePath,
           actualAbsolutePath: await source.existingAbsolutePath(),
-          scriptIds: source.scriptIds(),
+          scriptIds: source.scripts.map(s => s.scriptId),
           prettyName: await source.prettyName(),
-          compiledSourceRefToUrl:
-            source instanceof SourceFromMap
-              ? [...source.compiledToSourceUrl.entries()].map(
-                  ([k, v]) => [k.sourceReference, v] as [number, string],
-                )
-              : undefined,
-          sourceMap: source.sourceMap && {
-            url: source.sourceMap.url,
-            metadata: source.sourceMap.metadata,
-            sources: mapValues(
-              Object.fromEntries(source.sourceMap.sourceByUrl),
-              v => v.sourceReference,
-            ),
-          },
+          compiledSourceRefToUrl: source instanceof SourceFromMap
+            ? [...source.compiledToSourceUrl.entries()].map(
+              ([k, v]) => [k.sourceReference, v] as [number, string],
+            )
+            : undefined,
+          sourceMap: isSourceWithSourceMap(source)
+            ? {
+              url: source.sourceMap.metadata.sourceMapUrl,
+              metadata: source.sourceMap.metadata,
+              sources: mapValues(
+                Object.fromEntries(source.sourceMap.sourceByUrl),
+                v => v.sourceReference,
+              ),
+            }
+            : undefined,
         }))(),
       );
     }

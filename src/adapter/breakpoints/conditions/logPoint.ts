@@ -6,13 +6,13 @@ import { generate } from 'astring';
 import { createHash } from 'crypto';
 import { Statement } from 'estree';
 import { inject, injectable } from 'inversify';
-import { IBreakpointCondition } from '.';
 import { parseSource, returnErrorsFromStatements } from '../../../common/sourceCodeManipulations';
 import { getSyntaxErrorIn } from '../../../common/sourceUtils';
 import Dap from '../../../dap/api';
 import { invalidBreakPointCondition } from '../../../dap/errors';
 import { ProtocolError } from '../../../dap/protocolError';
 import { IEvaluator } from '../../evaluator';
+import { IBreakpointCondition } from '.';
 import { RuntimeLogPoint } from './runtimeLogPoint';
 import { SimpleCondition } from './simple';
 
@@ -83,13 +83,18 @@ export class LogPointCompiler {
         break;
       }
 
+      // tranform property shortand `{{foo}}` to `{({foo})}`, reparse:
+      if (block.body.length === 1 && block.body[0].type === 'BlockStatement') {
+        block.body = parseSource(`(${msg.slice(start + 1, end - 2)}})`);
+      }
+
       args.push(generate(this.serializeLogStatements(block.body)));
       formatParts.push('%O');
     }
 
     const evalArgs = [JSON.stringify(formatParts.join('')), ...args].join(', ');
     const result = `console.log(${evalArgs}), false`; // false for #1191
-    const hash = createHash('sha1').update(result).digest('hex').slice(0, 7);
+    const hash = createHash('sha256').update(result).digest('hex').slice(0, 7);
 
     return result + `\n//# sourceURL=logpoint-${hash}.cdp`;
   }

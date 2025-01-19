@@ -4,6 +4,7 @@
 
 import type { OptionsOfBufferResponseBody } from 'got';
 import type { Command, commands, ConfigurationTarget, workspace, WorkspaceFolder } from 'vscode';
+import type * as vscode from 'vscode';
 import type {
   IChromeLaunchConfiguration,
   INodeAttachConfiguration,
@@ -12,20 +13,26 @@ import type {
 import type Dap from '../dap/api';
 import type { IAutoAttachInfo } from '../targets/node/bootloader/environment';
 import type { ExcludedCaller } from '../ui/excludedCallersUI';
+import type { NetworkRequest } from '../ui/networkTree';
 import type { IStartProfileArguments } from '../ui/profiling/uiProfileManager';
 
 export const enum Contributions {
   BrowserBreakpointsView = 'jsBrowserBreakpoints',
+  XHRFetchBreakpointsView = 'jsXHRBreakpoints',
   DiagnosticsView = 'jsDebugDiagnostics',
 }
 
 export const enum CustomViews {
-  BrowserBreakpoints = 'jsBrowserBreakpoints',
+  EventListenerBreakpoints = 'jsBrowserBreakpoints',
+  XHRFetchBreakpoints = 'jsXHRBreakpoints',
   ExcludedCallers = 'jsExcludedCallers',
+  Network = 'jsDebugNetworkTree',
 }
 
 export const enum Commands {
-  AddCustomBreakpoints = 'extension.js-debug.addCustomBreakpoints',
+  ToggleCustomBreakpoints = 'extension.js-debug.addCustomBreakpoints',
+  AddXHRBreakpoints = 'extension.js-debug.addXHRBreakpoints',
+  EditXHRBreakpoint = 'extension.js-debug.editXHRBreakpoints',
   AttachProcess = 'extension.pwa-node-debug.attachNodeProcess',
   AutoAttachClearVariables = 'extension.js-debug.clearAutoAttachVariables',
   AutoAttachSetVariables = 'extension.js-debug.setAutoAttachVariables',
@@ -38,7 +45,7 @@ export const enum Commands {
   PickProcess = 'extension.js-debug.pickNodeProcess',
   PrettyPrint = 'extension.js-debug.prettyPrint',
   RemoveAllCustomBreakpoints = 'extension.js-debug.removeAllCustomBreakpoints',
-  RemoveCustomBreakpoint = 'extension.js-debug.removeCustomBreakpoint',
+  RemoveXHRBreakpoints = 'extension.js-debug.removeXHRBreakpoint',
   RevealPage = 'extension.js-debug.revealPage',
   RequestCDPProxy = 'extension.js-debug.requestCDPProxy',
   /** Use node-debug's command so existing keybindings work */
@@ -49,13 +56,32 @@ export const enum Commands {
   OpenEdgeDevTools = 'extension.js-debug.openEdgeDevTools',
   DisableSourceMapStepping = 'extension.js-debug.disableSourceMapStepping',
   EnableSourceMapStepping = 'extension.js-debug.enableSourceMapStepping',
-  //#region Excluded callers view
+  // #region Excluded callers view
   CallersGoToCaller = 'extension.js-debug.callers.goToCaller',
   CallersGoToTarget = 'extension.js-debug.callers.gotToTarget',
   CallersRemove = 'extension.js-debug.callers.remove',
   CallersRemoveAll = 'extension.js-debug.callers.removeAll',
   CallersAdd = 'extension.js-debug.callers.add',
-  //#endregion
+  // #endregion
+  // #region Network view
+  NetworkViewRequest = 'extension.js-debug.network.viewRequest',
+  NetworkCopyUri = 'extension.js-debug.network.copyUri',
+  NetworkOpenBody = 'extension.js-debug.network.openBody',
+  NetworkOpenBodyHex = 'extension.js-debug.network.openBodyInHex',
+  NetworkReplayXHR = 'extension.js-debug.network.replayXHR',
+  NetworkClear = 'extension.js-debug.network.clear',
+  // #endregion
+  // #region completions
+  CompletionNodeTool = 'extension.js-debug.completion.nodeTool',
+  // #endregion
+}
+
+export const enum DebugType {
+  ExtensionHost = 'pwa-extensionHost',
+  Terminal = 'node-terminal',
+  Node = 'pwa-node',
+  Chrome = 'pwa-chrome',
+  Edge = 'pwa-msedge',
 }
 
 export const preferredDebugTypes: ReadonlyMap<DebugType, string> = new Map([
@@ -68,14 +94,6 @@ export const preferredDebugTypes: ReadonlyMap<DebugType, string> = new Map([
 export const getPreferredOrDebugType = <T extends DebugType>(t: T) =>
   (preferredDebugTypes.get(t) as T) || t;
 
-export const enum DebugType {
-  ExtensionHost = 'pwa-extensionHost',
-  Terminal = 'node-terminal',
-  Node = 'pwa-node',
-  Chrome = 'pwa-chrome',
-  Edge = 'pwa-msedge',
-}
-
 // constructing it this way makes sure we can't forget to add a type:
 const debugTypes: { [K in DebugType]: null } = {
   [DebugType.ExtensionHost]: null,
@@ -86,7 +104,9 @@ const debugTypes: { [K in DebugType]: null } = {
 };
 
 const commandsObj: { [K in Commands]: null } = {
-  [Commands.AddCustomBreakpoints]: null,
+  [Commands.ToggleCustomBreakpoints]: null,
+  [Commands.AddXHRBreakpoints]: null,
+  [Commands.EditXHRBreakpoint]: null,
   [Commands.AttachProcess]: null,
   [Commands.AutoAttachClearVariables]: null,
   [Commands.AutoAttachSetVariables]: null,
@@ -98,8 +118,8 @@ const commandsObj: { [K in Commands]: null } = {
   [Commands.DebugNpmScript]: null,
   [Commands.PickProcess]: null,
   [Commands.PrettyPrint]: null,
+  [Commands.RemoveXHRBreakpoints]: null,
   [Commands.RemoveAllCustomBreakpoints]: null,
-  [Commands.RemoveCustomBreakpoint]: null,
   [Commands.RevealPage]: null,
   [Commands.StartProfile]: null,
   [Commands.StopProfile]: null,
@@ -114,6 +134,13 @@ const commandsObj: { [K in Commands]: null } = {
   [Commands.CallersRemoveAll]: null,
   [Commands.EnableSourceMapStepping]: null,
   [Commands.DisableSourceMapStepping]: null,
+  [Commands.NetworkViewRequest]: null,
+  [Commands.NetworkCopyUri]: null,
+  [Commands.NetworkOpenBody]: null,
+  [Commands.NetworkOpenBodyHex]: null,
+  [Commands.NetworkReplayXHR]: null,
+  [Commands.NetworkClear]: null,
+  [Commands.CompletionNodeTool]: null,
 };
 
 /**
@@ -150,6 +177,7 @@ export const enum Configuration {
   UnmapMissingSources = 'debug.javascript.unmapMissingSources',
   DefaultRuntimeExecutables = 'debug.javascript.defaultRuntimeExecutable',
   ResourceRequestOptions = 'debug.javascript.resourceRequestOptions',
+  EnableNetworkView = 'debug.javascript.enableNetworkView',
 }
 
 export type DebugByLinkState = 'on' | 'off' | 'always';
@@ -171,6 +199,7 @@ export interface IConfigurationTypes {
   [Configuration.UnmapMissingSources]: boolean;
   [Configuration.DefaultRuntimeExecutables]: { [K in DebugType]?: string };
   [Configuration.ResourceRequestOptions]: Partial<OptionsOfBufferResponseBody>;
+  [Configuration.EnableNetworkView]: boolean;
 }
 
 export interface IStackFrameContext {
@@ -217,7 +246,16 @@ export interface ICommandTypes {
   [Commands.CallersRemoveAll](): void;
   [Commands.EnableSourceMapStepping](): void;
   [Commands.DisableSourceMapStepping](): void;
+  [Commands.NetworkViewRequest](request: NetworkRequest): void;
+  [Commands.NetworkCopyUri](request: NetworkRequest): void;
+  [Commands.NetworkOpenBody](request: NetworkRequest): void;
+  [Commands.NetworkOpenBodyHex](request: NetworkRequest): void;
+  [Commands.NetworkReplayXHR](request: NetworkRequest): void;
+  [Commands.NetworkClear](): void;
+  [Commands.CompletionNodeTool](doc: vscode.TextDocument, position: vscode.Position): void;
 }
+
+export const networkFilesystemScheme = 'jsDebugNetworkFs';
 
 /**
  * Typed guard for registering a command.
@@ -225,7 +263,9 @@ export interface ICommandTypes {
 export const registerCommand = <K extends keyof ICommandTypes>(
   ns: typeof commands,
   key: K,
-  fn: (...args: Parameters<ICommandTypes[K]>) => Thenable<ReturnType<ICommandTypes[K]>>,
+  fn: (
+    ...args: Parameters<ICommandTypes[K]>
+  ) => void extends ReturnType<ICommandTypes[K]> ? void : Thenable<ReturnType<ICommandTypes[K]>>,
 ) => ns.registerCommand(key, fn);
 
 /**
@@ -272,6 +312,7 @@ export const enum ContextKey {
   CanPrettyPrint = 'jsDebugCanPrettyPrint',
   IsProfiling = 'jsDebugIsProfiling',
   IsMapSteppingDisabled = 'jsDebugIsMapSteppingDisabled',
+  NetworkAvailable = 'jsDebugNetworkAvailable',
 }
 
 export interface IContextKeyTypes {
@@ -279,6 +320,7 @@ export interface IContextKeyTypes {
   [ContextKey.CanPrettyPrint]: string[];
   [ContextKey.IsProfiling]: boolean;
   [ContextKey.IsMapSteppingDisabled]: boolean;
+  [ContextKey.NetworkAvailable]: boolean;
 }
 
 export const setContextKey = async <K extends keyof IContextKeyTypes>(

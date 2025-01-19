@@ -108,6 +108,18 @@ describe('variables', () => {
         p.assertLog();
       });
 
+      itIntegrates('shows errors', async ({ r }) => {
+        const p = await r.launchAndLoad('blank', {
+          customDescriptionGenerator:
+            'function (def) { if (this.customDescription) throw new Error("oh no!"); else return def }',
+        });
+        await p.logger.evaluateAndLog(`
+          class Foo { get getter() {} }
+          class Bar extends Foo { customDescription() { return 'Instance of bar'} }
+          new Bar();`);
+        p.assertLog();
+      });
+
       itIntegrates('using statement syntax', async ({ r }) => {
         const p = await r.launchAndLoad('blank', {
           customDescriptionGenerator:
@@ -353,8 +365,19 @@ describe('variables', () => {
       const p = await r.launchUrlAndLoad('minified/index.html');
       p.cdp.Runtime.evaluate({ expression: `test()` });
       const event = await p.dap.once('stopped');
-      await p.logger.logStackTrace(event.threadId!, true);
+      const stacks = await p.logger.logStackTrace(event.threadId!, Infinity);
+
+      p.log('\nPreserves eval sourceURL (#1259):'); // https://github.com/microsoft/vscode-js-debug/issues/1259#issuecomment-1442584596
+      p.log(
+        await p.dap.evaluate({
+          expression: 'arg1; thenSomethingInvalid()',
+          context: 'repl',
+          frameId: stacks[0].id,
+        }),
+      );
+
       await p.dap.continue({ threadId: event.threadId! });
+
       p.assertLog();
     });
 
@@ -388,14 +411,22 @@ describe('variables', () => {
       await walkVariables(p.dap, v, (variable, depth) => {
         p.log('  '.repeat(depth) + variable.evaluateName);
         return (
-          !variable.name.startsWith('__') &&
-          !variable.name.startsWith('[[') &&
-          variable.name !== 'this'
+          !variable.name.startsWith('__')
+          && !variable.name.startsWith('[[')
+          && variable.name !== 'this'
         );
       });
 
       p.assertLog();
     });
+  });
+
+  itIntegrates('map variable without preview (#1824)', async ({ r }) => {
+    const p = await r.launchAndLoad('blank');
+    await p.logger.evaluateAndLog(`
+      class A { #bar = new Map([[1, 2]]) }
+      new A();`);
+    p.assertLog();
   });
 
   itIntegrates('readMemory/writeMemory', async ({ r }) => {

@@ -156,8 +156,9 @@ export class BrowserTarget implements ITarget {
   }
 
   parent(): ITarget | undefined {
-    if (this.parentTarget && !jsTypes.has(this.parentTarget.type()))
+    if (this.parentTarget && !jsTypes.has(this.parentTarget.type())) {
       return this.parentTarget.parentTarget;
+    }
     return this.parentTarget;
   }
 
@@ -236,6 +237,10 @@ export class BrowserTarget implements ITarget {
     return domDebuggerTypes.has(this.type());
   }
 
+  supportsXHRBreakpoints(): boolean {
+    return domDebuggerTypes.has(this.type());
+  }
+
   scriptUrlToUrl(url: string): string {
     return urlUtils.completeUrl(this._targetInfo.url, url) || url;
   }
@@ -270,15 +275,14 @@ export class BrowserTarget implements ITarget {
     }
 
     let threadName = this._targetInfo.title;
-    const isAmbiguous =
-      threadName &&
-      this._manager
+    const isAmbiguous = threadName
+      && this._manager
         .targetList()
         .some(
           target =>
-            target instanceof BrowserTarget &&
-            target !== this &&
-            target._targetInfo.title === this._targetInfo.title,
+            target instanceof BrowserTarget
+            && target !== this
+            && target._targetInfo.title === this._targetInfo.title,
         );
 
     if (!isAmbiguous) {

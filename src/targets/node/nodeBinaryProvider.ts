@@ -2,18 +2,20 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { inject, injectable, optional } from 'inversify';
-import { basename, dirname, extname, isAbsolute, resolve } from 'path';
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'path';
 import type * as vscodeType from 'vscode';
-import * as nls from 'vscode-nls';
 import { EnvironmentVars } from '../../common/environmentVars';
+import { existsInjected } from '../../common/fsUtils';
 import { ILogger, LogTag } from '../../common/logging';
 import { findExecutable, findInPath } from '../../common/pathUtils';
 import { spawnAsync } from '../../common/processUtils';
 import { Semver } from '../../common/semver';
-import { getNormalizedBinaryName } from '../../common/urlUtils';
+import { getNormalizedBinaryName, nearestDirectoryWhere } from '../../common/urlUtils';
 import {
   cannotFindNodeBinary,
+  cwdDoesNotExist,
   ErrorCodes,
   isErrorOfType,
   nodeBinaryOutOfDate,
@@ -22,13 +24,12 @@ import { ProtocolError } from '../../dap/protocolError';
 import { FS, FsPromises, VSCodeApi } from '../../ioc-extras';
 import { IPackageJsonProvider } from './packageJsonProvider';
 
-const localize = nls.loadMessageBundle();
-
 export const INodeBinaryProvider = Symbol('INodeBinaryProvider');
 
 export const enum Capability {
   UseSpacesInRequirePath,
   UseInspectPublishUid,
+  UseExperimentalNetworking,
 }
 
 /**
@@ -74,16 +75,14 @@ const warningMessages: ReadonlyArray<IWarningMessage> = [
   {
     inclusiveMin: new Semver(16, 0, 0),
     inclusiveMax: new Semver(16, 3, 99),
-    message: localize(
-      'warning.16bpIssue',
+    message: l10n.t(
       'Some breakpoints might not work in your version of Node.js. We recommend upgrading for the latest bug, performance, and security fixes. Details: https://aka.ms/AAcsvqm',
     ),
   },
   {
     inclusiveMin: new Semver(7, 0, 0),
     inclusiveMax: new Semver(8, 99, 99),
-    message: localize(
-      'warning.8outdated',
+    message: l10n.t(
       "You're running an outdated version of Node.js. We recommend upgrading for the latest bug, performance, and security fixes.",
     ),
   },
@@ -131,6 +130,14 @@ export class NodeBinary {
     if (version.gte(new Semver(12, 6, 0))) {
       this.capabilities.add(Capability.UseInspectPublishUid);
     }
+
+    // todo@connor4312: the current API we get in Node.js is pretty tiny and
+    // I don't want to ship it by default in its current version, ref
+    // https://github.com/nodejs/node/pull/53593#issuecomment-2276367389
+    // Users can still turn it on by setting `experimentalNetworking: on`.
+    // if (version.gte(new Semver(22, 6, 0)) && version.lt(new Semver(24, 0, 0))) {
+    //   this.capabilities.add(Capability.UseExperimentalNetworking);
+    // }
   }
 
   /**
@@ -201,7 +208,7 @@ export interface INodeBinaryProvider {
  * it's a debuggable version./
  */
 @injectable()
-export class NodeBinaryProvider {
+export class NodeBinaryProvider implements INodeBinaryProvider {
   /**
    * A set of binary paths we know are good and which can skip additional
    * validation. We don't store bad mappings, because a user might reinstall
@@ -247,21 +254,35 @@ export class NodeBinaryProvider {
     return Promise.resolve(false);
   }
 
+  private async resolveNodeModulesLocation(
+    env: EnvironmentVars,
+    executable: string,
+    cwd: string | undefined,
+  ) {
+    if (!cwd || isAbsolute(executable) || !isAbsolute(cwd)) {
+      return undefined;
+    }
+
+    return nearestDirectoryWhere(
+      cwd,
+      dir => findExecutable(this.fs, join(dir, 'node_modules', '.bin', executable), env),
+    );
+  }
+
   private async resolveAndValidateInner(
     env: EnvironmentVars,
     executable: string,
     explicitVersion: number | undefined,
     cwd: string | undefined,
   ): Promise<NodeBinary> {
-    const location = await this.resolveBinaryLocation(executable, env);
+    let location = await this.resolveBinaryLocation(executable, env);
+    if (!location) {
+      location = await this.resolveNodeModulesLocation(env, executable, cwd);
+    }
+
     this.logger.info(LogTag.RuntimeLaunch, 'Using binary at', { location, executable });
     if (!location) {
-      throw new ProtocolError(
-        cannotFindNodeBinary(
-          executable,
-          localize('runtime.node.notfound.enoent', 'path does not exist'),
-        ),
-      );
+      throw new ProtocolError(cannotFindNodeBinary(executable, l10n.t('path does not exist')));
     }
 
     if (explicitVersion) {
@@ -356,12 +377,11 @@ export class NodeBinaryProvider {
       });
       return stdout.trim();
     } catch (e) {
-      throw new ProtocolError(
-        cannotFindNodeBinary(
-          binary,
-          localize('runtime.node.notfound.spawnErr', 'error getting version: {0}', e.message),
-        ),
-      );
+      if (cwd && !(await existsInjected(this.fs, cwd))?.isDirectory()) {
+        throw new ProtocolError(cwdDoesNotExist(cwd));
+      }
+
+      throw new ProtocolError(cannotFindNodeBinary(binary, e.message));
     }
   }
 }
@@ -384,11 +404,8 @@ export class InteractiveNodeBinaryProvider extends NodeBinaryProvider {
       return false;
     }
 
-    const yes = localize('yes', 'Yes');
-    const response = await this.vscode.window.showErrorMessage(
-      localize('outOfDate', '{0} Would you like to try debugging anyway?', message),
-      yes,
-    );
+    const yes = l10n.t('Yes');
+    const response = await this.vscode.window.showErrorMessage(message, yes);
 
     return response === yes;
   }

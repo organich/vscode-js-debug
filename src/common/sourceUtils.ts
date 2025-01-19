@@ -2,9 +2,10 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as genMap from '@jridgewell/gen-mapping';
+import { AnyMap, GREATEST_LOWER_BOUND } from '@jridgewell/trace-mapping';
 import { Node as AcornNode, parseExpressionAt, Parser } from 'acorn';
 import { generate } from 'astring';
-import { replace, traverse, VisitorOption } from 'estraverse';
 import {
   Expression,
   ExpressionStatement,
@@ -14,14 +15,30 @@ import {
   Program,
   Statement,
 } from 'estree';
-import { promises as fsPromises } from 'fs';
-import { NullablePosition, Position, SourceMapConsumer, SourceMapGenerator } from 'source-map';
 import { LineColumn } from '../adapter/breakpoints/breakpointBase';
-import { LocalFsUtils } from './fsUtils';
-import { Hasher } from './hash';
-import { isWithinAsar } from './pathUtils';
-import { acornOptions, parseProgram } from './sourceCodeManipulations';
-import { SourceMap } from './sourceMaps/sourceMap';
+import {
+  acornOptions,
+  parseProgram,
+  replace,
+  traverse,
+  VisitorOption,
+} from './sourceCodeManipulations';
+import { NullableGeneratedPosition, SourceMap } from './sourceMaps/sourceMap';
+
+export const enum SourceConstants {
+  /**
+   * Extension of evaluated sources internal to the debugger. Sources with
+   * this suffix will be ignored when displaying sources or stacktracees.
+   */
+  InternalExtension = '.cdp',
+
+  /**
+   * Extension of evaluated REPL source. Stack traces which include frames
+   * from this suffix will be truncated to keep only frames from code called
+   * by the REPL.
+   */
+  ReplExtension = '.repl',
+}
 
 export async function prettyPrintAsSourceMap(
   fileName: string,
@@ -30,30 +47,28 @@ export async function prettyPrintAsSourceMap(
   sourceMapUrl: string,
 ): Promise<SourceMap | undefined> {
   const ast = Parser.parse(minified, { locations: true, ecmaVersion: 'latest' });
-  const sourceMap = new SourceMapGenerator({ file: fileName });
+  const sourceMap = new genMap.GenMapping({ file: fileName });
 
   // provide a fake SourceMapGenerator since we want to actually add the
   // *reversed* mappings -- we're creating a fake 'original' source.
   const beautified = generate(ast, {
     sourceMap: {
-      setSourceContent: (file, content) => sourceMap.setSourceContent(file, content),
-      applySourceMap: (smc, file, path) => sourceMap.applySourceMap(smc, file, path),
-      toJSON: () => sourceMap.toJSON(),
-      toString: () => sourceMap.toString(),
       addMapping: mapping =>
-        sourceMap.addMapping({
-          generated: mapping.original,
-          original: { column: mapping.generated.column, line: mapping.generated.line },
-          source: fileName,
-          name: mapping.name,
-        }),
+        genMap.addSegment(
+          sourceMap,
+          mapping.original.line - 1,
+          mapping.original.column,
+          fileName,
+          mapping.generated.line - 1,
+          mapping.generated.column,
+        ),
     },
   });
 
-  sourceMap.setSourceContent(fileName, beautified);
+  genMap.setSourceContent(sourceMap, fileName, beautified);
 
   return new SourceMap(
-    await SourceMapConsumer.fromSourceMap(sourceMap),
+    new AnyMap(genMap.toDecodedMap(sourceMap)),
     {
       sourceMapUrl,
       compiledPath,
@@ -68,7 +83,7 @@ export function rewriteTopLevelAwait(code: string): string | undefined {
   let program: Program;
   try {
     // todo: strict needed due to https://github.com/acornjs/acorn/issues/988
-    program = parseProgram(code, /* strict= */ true);
+    program = parseProgram(code);
   } catch (e) {
     return undefined;
   }
@@ -90,16 +105,19 @@ export function rewriteTopLevelAwait(code: string): string | undefined {
     enter(node, parent) {
       switch (node.type) {
         case 'ClassDeclaration':
-          return makeAssignment(node.id || { type: 'Identifier', name: '_default' }, {
-            ...node,
-            type: 'ClassExpression',
-          });
+          return {
+            replace: makeAssignment(node.id || { type: 'Identifier', name: '_default' }, {
+              ...node,
+              type: 'ClassExpression',
+            }),
+          };
         case 'FunctionDeclaration':
-          this.skip();
-          return makeAssignment(node.id || { type: 'Identifier', name: '_default' }, {
-            ...node,
-            type: 'FunctionExpression',
-          });
+          return {
+            replace: makeAssignment(node.id || { type: 'Identifier', name: '_default' }, {
+              ...node,
+              type: 'FunctionExpression',
+            }),
+          };
         case 'FunctionExpression':
         case 'ArrowFunctionExpression':
         case 'MethodDefinition':
@@ -141,7 +159,7 @@ export function rewriteTopLevelAwait(code: string): string | undefined {
           stmts.splice(stmts.indexOf(node), 1, ...spliced);
       }
     },
-  }) as Program;
+  });
 
   // Top-level return is not allowed.
   if (!containsAwait || containsReturn) {
@@ -150,9 +168,9 @@ export function rewriteTopLevelAwait(code: string): string | undefined {
 
   // If we expect the value (last statement is an expression),
   // return it from the inner function.
-  const last = replaced.body[replaced.body.length - 1];
+  const last = program.body[program.body.length - 1];
   if (last.type === 'ExpressionStatement') {
-    replaced.body[replaced.body.length - 1] = {
+    program.body[program.body.length - 1] = {
       type: 'ReturnStatement',
       argument: last.expression,
     };
@@ -233,34 +251,6 @@ export function parseSourceMappingUrl(content: string): string | undefined {
   return sourceMapUrl.trim();
 }
 
-const hasher = new Hasher();
-
-export async function checkContentHash(
-  absolutePath: string,
-  contentHash?: string,
-  contentOverride?: string,
-): Promise<string | undefined> {
-  if (!absolutePath) {
-    return undefined;
-  }
-
-  if (isWithinAsar(absolutePath)) {
-    return undefined;
-  }
-
-  if (!contentHash) {
-    const exists = await new LocalFsUtils(fsPromises).exists(absolutePath);
-    return exists ? absolutePath : undefined;
-  }
-
-  const result =
-    typeof contentOverride === 'string'
-      ? await hasher.verifyBytes(contentOverride, contentHash, true)
-      : await hasher.verifyFile(absolutePath, contentHash, true);
-
-  return result ? absolutePath : undefined;
-}
-
 interface INotNullRange {
   line: number;
   column: number;
@@ -276,21 +266,21 @@ interface INotNullRange {
 export function getOptimalCompiledPosition(
   sourceUrl: string,
   uiLocation: LineColumn,
-  map: SourceMapConsumer,
-): NullablePosition {
+  map: SourceMap,
+): NullableGeneratedPosition {
   const prevLocation = map.generatedPositionFor({
     source: sourceUrl,
     line: uiLocation.lineNumber,
     column: uiLocation.columnNumber - 1, // source map columns are 0-indexed
-    bias: SourceMapConsumer.GREATEST_LOWER_BOUND,
+    bias: GREATEST_LOWER_BOUND,
   });
 
-  const getVariance = (position: NullablePosition) => {
+  const getVariance = (position: NullableGeneratedPosition) => {
     if (position.line === null || position.column === null) {
       return 10e10;
     }
 
-    const original = map.originalPositionFor(position as Position);
+    const original = map.originalPositionFor(position);
     return original.line !== null ? Math.abs(uiLocation.lineNumber - original.line) : 10e10;
   };
 
@@ -324,26 +314,26 @@ export function getOptimalCompiledPosition(
  * Expression node could not go.
  */
 export const isInPatternSlot = (node: Pattern, parent: Node | null | undefined): boolean =>
-  !!parent &&
-  (((parent.type === 'FunctionExpression' ||
-    parent.type === 'FunctionDeclaration' ||
-    parent.type === 'ArrowFunctionExpression') &&
-    parent.params.includes(node)) ||
-    ((parent.type === 'ForInStatement' || parent.type === 'ForOfStatement') &&
-      parent.left === node) ||
-    (parent.type === 'VariableDeclarator' && parent.id === node) ||
-    (parent.type === 'AssignmentPattern' && parent.left === node) ||
-    (parent.type === 'CatchClause' && parent.param === node) ||
-    ('kind' in parent && parent.kind === 'init' && parent.value === node) ||
-    (parent.type === 'RestElement' && parent.argument === node) ||
-    (parent.type === 'AssignmentPattern' && parent.left === node));
+  !!parent
+  && (((parent.type === 'FunctionExpression'
+    || parent.type === 'FunctionDeclaration'
+    || parent.type === 'ArrowFunctionExpression')
+    && parent.params.includes(node))
+    || ((parent.type === 'ForInStatement' || parent.type === 'ForOfStatement')
+      && parent.left === node)
+    || (parent.type === 'VariableDeclarator' && parent.id === node)
+    || (parent.type === 'AssignmentPattern' && parent.left === node)
+    || (parent.type === 'CatchClause' && parent.param === node)
+    || ('kind' in parent && parent.kind === 'init' && parent.value === node)
+    || (parent.type === 'RestElement' && parent.argument === node)
+    || (parent.type === 'AssignmentPattern' && parent.left === node));
 
 /**
  * Returns the syntax error in the given code, if any.
  */
 export function getSyntaxErrorIn(code: string): Error | void {
   try {
-    new Function(code);
+    new Function(code); // CodeQL [SM04509] Function code is never evaluated
   } catch (e) {
     return e;
   }

@@ -9,23 +9,20 @@ import { ICdpApi } from '../../cdp/connection';
 import { MapUsingProjection } from '../../common/datastructure/mapUsingProjection';
 import { EventEmitter } from '../../common/events';
 import { ILogger, LogTag } from '../../common/logging';
-import { node15InternalsPrefix } from '../../common/node15Internal';
+import { node15InternalsPrefix, nodeInternalsToken } from '../../common/node15Internal';
 import { memoizeLast, trailingEdgeThrottle, truthy } from '../../common/objUtils';
 import * as pathUtils from '../../common/pathUtils';
 import { getDeferred, IDeferred } from '../../common/promiseUtil';
+import { ISourcePathResolver } from '../../common/sourcePathResolver';
 import { escapeRegexSpecialChars } from '../../common/stringUtils';
 import * as urlUtils from '../../common/urlUtils';
 import { AnyLaunchConfiguration } from '../../configuration';
 import Dap from '../../dap/api';
 import { ITarget } from '../../targets/targets';
-import {
-  ISourceWithMap,
-  isSourceWithMap,
-  Source,
-  SourceContainer,
-  SourceFromMap,
-} from '../sources';
+import { ISourceScript, ISourceWithMap, isSourceWithMap, Source, SourceFromMap } from '../source';
+import { SourceContainer } from '../sourceContainer';
 import { getSourceSuffix } from '../templates';
+import { IScriptSkipper } from './scriptSkipper';
 import { simpleGlobsToRe } from './simpleGlobToRe';
 
 interface ISharedSkipToggleEvent {
@@ -48,13 +45,16 @@ function preprocessNodeInternals(userSkipPatterns: ReadonlyArray<string>): strin
   return nodeInternalPatterns.length > 0 ? nodeInternalPatterns : undefined;
 }
 
-function preprocessAuthoredGlobs(userSkipPatterns: ReadonlyArray<string>): string[] {
+function preprocessAuthoredGlobs(
+  spr: ISourcePathResolver,
+  userSkipPatterns: ReadonlyArray<string>,
+): string[] {
   const authoredGlobs = userSkipPatterns
-    .filter(pattern => !pattern.includes('<node_internals>'))
+    .filter(pattern => !pattern.includes(nodeInternalsToken))
     .map(pattern =>
       urlUtils.isAbsolute(pattern)
-        ? urlUtils.absolutePathToFileUrl(pattern)
-        : pathUtils.forceForwardSlashes(pattern),
+        ? urlUtils.absolutePathToFileUrlWithDetection(spr.rebaseLocalToRemote(pattern))
+        : pathUtils.forceForwardSlashes(pattern)
     )
     .map(urlUtils.lowerCaseInsensitivePath);
 
@@ -62,7 +62,7 @@ function preprocessAuthoredGlobs(userSkipPatterns: ReadonlyArray<string>): strin
 }
 
 @injectable()
-export class ScriptSkipper {
+export class ScriptSkipper implements IScriptSkipper {
   private static sharedSkipsEmitter = new EventEmitter<ISharedSkipToggleEvent>();
 
   /**
@@ -72,7 +72,9 @@ export class ScriptSkipper {
   private _authoredGlobs: readonly string[];
 
   /** Memoized computer for non-<node_internals> skipfiles */
-  private _regexForAuthored = memoizeLast(simpleGlobsToRe);
+  private _regexForAuthored = memoizeLast((re: readonly string[]) =>
+    simpleGlobsToRe(re, s => urlUtils.charRangeToUrlReGroup(s, 0, s.length, true, true))
+  );
 
   /**
    * Globs for node internals. These are treated specially, at least until we
@@ -105,6 +107,7 @@ export class ScriptSkipper {
 
   constructor(
     @inject(AnyLaunchConfiguration) { skipFiles }: AnyLaunchConfiguration,
+    @inject(ISourcePathResolver) sourcePathResolver: ISourcePathResolver,
     @inject(ILogger) private readonly logger: ILogger,
     @inject(ICdpApi) private readonly cdp: Cdp.Api,
     @inject(ITarget) target: ITarget,
@@ -112,15 +115,16 @@ export class ScriptSkipper {
     this._targetId = target.id();
     this._rootTargetId = getRootTarget(target).id();
     this._isUrlFromSourceMapSkipped = new MapUsingProjection<string, boolean>(key =>
-      this._normalizeUrl(key),
+      this._normalizeUrl(key)
     );
 
-    this._authoredGlobs = preprocessAuthoredGlobs(skipFiles);
+    this._authoredGlobs = preprocessAuthoredGlobs(sourcePathResolver, skipFiles);
     this._nodeInternalsGlobs = preprocessNodeInternals(skipFiles);
 
     this._initNodeInternals(target); // Purposely don't wait, no need to slow things down
-    this._updateSkippedDebounce = trailingEdgeThrottle(500, () =>
-      this._updateGeneratedSkippedSources(),
+    this._updateSkippedDebounce = trailingEdgeThrottle(
+      500,
+      () => this._updateGeneratedSkippedSources(),
     );
 
     if (skipFiles.length) {
@@ -195,18 +199,18 @@ export class ScriptSkipper {
       return true;
     }
 
-    return this._testSkipAuthored(this._normalizeUrl(url));
+    return this._testSkipAuthored(url);
   }
 
   private async _updateSourceWithSkippedSourceMappedSources(
     source: ISourceWithMap,
-    scriptIds: Cdp.Runtime.ScriptId[],
+    scripts: readonly ISourceScript[],
   ): Promise<void> {
     // Order "should" be correct
     const parentIsSkipped = this.isScriptSkipped(source.url);
     const skipRanges: Cdp.Debugger.ScriptPosition[] = [];
     let inSkipRange = parentIsSkipped;
-    Array.from(source.sourceMap.sourceByUrl.values()).forEach(authoredSource => {
+    for (const authoredSource of source.sourceMap.sourceByUrl.values()) {
       let isSkippedSource = this.isScriptSkipped(authoredSource.url);
       if (typeof isSkippedSource === 'undefined') {
         // If not toggled or specified in launch config, inherit the parent's status
@@ -214,15 +218,21 @@ export class ScriptSkipper {
       }
 
       if (isSkippedSource !== inSkipRange) {
-        const locations = this._sourceContainer.currentSiblingUiLocations(
-          { source: authoredSource, lineNumber: 1, columnNumber: 1 },
-          source,
-        );
-        if (locations[0]) {
-          skipRanges.push({
-            lineNumber: locations[0].lineNumber - 1,
-            columnNumber: locations[0].columnNumber - 1,
-          });
+        const [[start], [end]] = await Promise.all([
+          this._sourceContainer.currentSiblingUiLocations(
+            { source: authoredSource, lineNumber: 1, columnNumber: 1 },
+            source,
+          ),
+          this._sourceContainer.currentSiblingUiLocations(
+            { source: authoredSource, lineNumber: Infinity, columnNumber: 1 },
+            source,
+          ),
+        ]);
+        if (start && end) {
+          skipRanges.push(
+            { lineNumber: start.lineNumber - 1, columnNumber: start.columnNumber - 1 },
+            { lineNumber: end.lineNumber - 1, columnNumber: end.columnNumber - 1 },
+          );
           inSkipRange = !inSkipRange;
         } else {
           this.logger.error(
@@ -231,18 +241,18 @@ export class ScriptSkipper {
           );
         }
       }
-    });
-
-    let targets = scriptIds;
-    if (!skipRanges.length) {
-      targets = targets.filter(t => this._scriptsWithSkipping.has(t));
-      targets.forEach(t => this._scriptsWithSkipping.delete(t));
     }
 
-    await Promise.all(
-      targets.map(scriptId =>
-        this.cdp.Debugger.setBlackboxedRanges({ scriptId, positions: skipRanges }),
-      ),
+    let targets = scripts;
+    if (!skipRanges.length) {
+      targets = targets.filter(t => this._scriptsWithSkipping.has(t.scriptId));
+      targets.forEach(t => this._scriptsWithSkipping.delete(t.scriptId));
+    }
+
+    // todo(conno4312): it seems like the current version of Chrome used in
+    // playwright tests doesn't send a response to this method :/
+    targets.map(({ scriptId }) =>
+      this.cdp.Debugger.setBlackboxedRanges({ scriptId, positions: skipRanges })
     );
   }
 
@@ -250,7 +260,7 @@ export class ScriptSkipper {
     this._initializeSkippingValueForSource(source);
   }
 
-  private _initializeSkippingValueForSource(source: Source, scriptIds = source.scriptIds()) {
+  private _initializeSkippingValueForSource(source: Source, scripts = source.scripts) {
     const url = source.url;
     let skipped = this.isScriptSkipped(url);
 
@@ -258,10 +268,9 @@ export class ScriptSkipper {
     // This can happen if the user skips absolute paths which are served from a different
     // place in the server.
     if (
-      !skipped &&
-      source.absolutePath &&
-      urlUtils.isAbsolute(source.absolutePath) &&
-      this._testSkipAuthored(urlUtils.absolutePathToFileUrl(source.absolutePath))
+      !skipped
+      && source.absolutePath
+      && this._testSkipAuthored(urlUtils.absolutePathToFileUrl(source.absolutePath))
     ) {
       this.setIsUrlBlackboxSkipped(url, true);
       skipped = true;
@@ -277,10 +286,10 @@ export class ScriptSkipper {
       }
 
       for (const nestedSource of source.sourceMap.sourceByUrl.values()) {
-        this._initializeSkippingValueForSource(nestedSource, scriptIds);
+        this._initializeSkippingValueForSource(nestedSource, scripts);
       }
 
-      this._updateSourceWithSkippedSourceMappedSources(source, scriptIds);
+      this._updateSourceWithSkippedSourceMappedSources(source, scripts);
     }
   }
 
@@ -329,10 +338,7 @@ export class ScriptSkipper {
       const compiledSources = Array.from(source.compiledToSourceUrl.keys());
       await Promise.all(
         compiledSources.map(compiledSource =>
-          this._updateSourceWithSkippedSourceMappedSources(
-            compiledSource,
-            compiledSource.scriptIds(),
-          ),
+          this._updateSourceWithSkippedSourceMappedSources(compiledSource, compiledSource.scripts)
         ),
       );
     } else {

@@ -135,13 +135,12 @@ export class TerminalProcess implements IProgram {
   private didStop = false;
   private onStopped!: (killed: boolean) => void;
   public readonly stopped = new Promise<IStopMetadata>(
-    resolve =>
-      (this.onStopped = killed => {
-        this.didStop = true;
-        resolve({ code: 0, killed });
-      }),
+    resolve => (this.onStopped = killed => {
+      this.didStop = true;
+      resolve({ code: 0, killed });
+    }),
   );
-  private loop?: { timer: NodeJS.Timer; processId: number };
+  private loop?: { timer: NodeJS.Timeout; processId: number };
 
   constructor(
     private readonly terminalResult: Dap.RunInTerminalResult,

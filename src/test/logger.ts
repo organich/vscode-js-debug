@@ -33,8 +33,8 @@ export const walkVariables = async (
     return;
   }
 
-  const hasHints =
-    typeof variable.namedVariables === 'number' || typeof variable.indexedVariables === 'number';
+  const hasHints = typeof variable.namedVariables === 'number'
+    || typeof variable.indexedVariables === 'number';
   if (hasHints) {
     if (variable.namedVariables) {
       const named = await dap.variables({
@@ -148,7 +148,7 @@ export class Logger {
     return variable;
   }
 
-  async logStackTrace(threadId: number, withScopes?: boolean) {
+  async logStackTrace(threadId: number, withScopes = 0) {
     const initial = await this._dap.stackTrace({ threadId });
     const stack = initial.stackFrames;
     let totalFrames = initial.totalFrames || stack.length;
@@ -161,7 +161,7 @@ export class Logger {
       stack.push(...response.stackFrames);
       if (response.totalFrames) totalFrames = Math.min(totalFrames, response.totalFrames);
     }
-    let emptyLine = !!withScopes;
+    let emptyLine = withScopes > 0;
     for (const frame of stack) {
       if (emptyLine) this._log('');
       if (frame.presentationHint === 'label') {
@@ -169,16 +169,15 @@ export class Logger {
         emptyLine = false;
         continue;
       }
-      const origin =
-        frame.source && frame.source.presentationHint === 'deemphasize'
-          ? ` <hidden: ${frame.source.origin || ''}>`
-          : '';
+      const origin = frame.source && frame.source.presentationHint === 'deemphasize'
+        ? ` <hidden: ${frame.source.origin || ''}>`
+        : '';
       this._log(
-        `${frame.name} @ ${frame.source ? frame.source.path! : 'unknown'}:${frame.line}:${
-          frame.column
-        }${origin}`,
+        `${frame.name} @ ${
+          frame.source ? frame.source.path! : 'unknown'
+        }:${frame.line}:${frame.column}${origin}`,
       );
-      if (!withScopes) continue;
+      if (withScopes-- <= 0) continue;
       const scopes = await this._dap.scopes({ frameId: frame.id });
       if (typeof scopes === 'string') {
         this._log(`  scope error: ${scopes}`);

@@ -6,13 +6,18 @@ import { Node, parseExpressionAt } from 'acorn';
 import { randomBytes } from 'crypto';
 import { Expression } from 'estree';
 import Cdp from '../../cdp/api';
-import { SourceConstants } from '../sources';
+import { SourceConstants } from '../../common/sourceUtils';
 
 /**
  * Gets the suffix containing the `sourceURL` to mark a script as internal.
  */
 export const getSourceSuffix = () =>
   `\n//# sourceURL=eval-${randomBytes(4).toString('hex')}${SourceConstants.InternalExtension}\n`;
+
+export type TemplateFunction<A extends unknown[]> = {
+  expr: (...args: A) => string;
+  decl: (...args: A) => string;
+};
 
 /**
  * Creates a template for the given function that replaces its arguments
@@ -43,21 +48,21 @@ export const getSourceSuffix = () =>
  * })();
  * ```
  */
-export function templateFunction<A>(fn: (a: A) => void): (a: string) => string;
-export function templateFunction<A, B>(fn: (a: A, b: B) => void): (a: string, b: string) => string;
+export function templateFunction<A>(fn: (a: A) => void): TemplateFunction<[string]>;
+export function templateFunction<A, B>(
+  fn: (a: A, b: B) => void,
+): TemplateFunction<[string, string]>;
 export function templateFunction<A, B, C>(
   fn: (a: A, b: B, c: C) => void,
-): (a: string, b: string, c: string) => string;
-export function templateFunction<Args extends unknown[]>(fn: string): (...args: Args) => string;
+): TemplateFunction<[string, string, string]>;
+export function templateFunction<Args extends unknown[]>(fn: string): TemplateFunction<Args>;
 export function templateFunction<Args extends unknown[]>(
   fn: string | ((...args: Args) => void),
-): (...args: string[]) => string {
+): TemplateFunction<string[]> {
   return templateFunctionStr('' + fn);
 }
 
-export function templateFunctionStr<Args extends string[]>(
-  stringified: string,
-): (...args: Args) => string {
+function templateFunctionStr<Args extends string[]>(stringified: string): TemplateFunction<Args> {
   const decl = parseExpressionAt(stringified, 0, {
     ecmaVersion: 'latest',
     locations: true,
@@ -76,10 +81,14 @@ export function templateFunctionStr<Args extends string[]>(
   });
 
   const { start, end } = decl.body as unknown as Node;
-  return (...args) => `(() => {
+  const inner = (args: string[]) => `
     ${args.map((a, i) => `let ${params[i]} = ${a}`).join('; ')};
     ${stringified.slice(start + 1, end - 1)}
-  })();${getSourceSuffix()}`;
+  `;
+  return {
+    expr: (...args: Args) => `(()=>{${inner(args)}})();\n${getSourceSuffix()}`,
+    decl: (...args: Args) => `function(...runtimeArgs){${inner(args)};\n${getSourceSuffix()}}`,
+  };
 }
 
 /**
@@ -97,13 +106,20 @@ type RemoteObjectWithType<R, ByValue> = ByValue extends true
   ? Omit<Cdp.Runtime.RemoteObject, 'value'> & { value: R }
   : Omit<Cdp.Runtime.RemoteObject, 'value'> & { objectId: string };
 
+/** Represets a CDP remote object that can be used as an argument to RemoteFunctions */
+export class RemoteObjectId {
+  constructor(public readonly objectId: string) {}
+}
+
 /**
  * Wraps the function such that it can be invoked over CDP. Returns a function
  * that takes the CDP and arguments with which to invoke the function. The
  * arguments should be simple objects.
  */
 export function remoteFunction<Args extends unknown[], R>(fn: string | ((...args: Args) => R)) {
-  const stringified = ('' + fn).replace('}', getSourceSuffix() + '}');
+  let stringified = '' + fn;
+  const endIndex = stringified.lastIndexOf('}');
+  stringified = stringified.slice(0, endIndex) + getSourceSuffix() + stringified.slice(endIndex);
 
   // Some ugly typing here, but it gets us type safety. Mainly we want to:
   //  1. Have args that extend the function arg and omit the args we provide (easy)
@@ -113,16 +129,21 @@ export function remoteFunction<Args extends unknown[], R>(fn: string | ((...args
     cdp,
     args,
     ...options
-  }: { cdp: Cdp.Api; args: Args } & Omit<
-    Cdp.Runtime.CallFunctionOnParams,
-    'functionDeclaration' | 'arguments' | 'returnByValue'
-  > &
-    (ByValue extends true ? { returnByValue: ByValue } : {})): Promise<
+  }:
+    & { cdp: Cdp.Api; args: Args | RemoteObjectId[] }
+    & Omit<
+      Cdp.Runtime.CallFunctionOnParams,
+      'functionDeclaration' | 'arguments' | 'returnByValue'
+    >
+    & (ByValue extends true ? { returnByValue: ByValue } : {})
+  ): Promise<
     RemoteObjectWithType<R, ByValue>
   > => {
     const result = await cdp.Runtime.callFunctionOn({
       functionDeclaration: stringified,
-      arguments: args.map(value => ({ value })),
+      arguments: args.map(value =>
+        value instanceof RemoteObjectId ? { objectId: value.objectId } : { value }
+      ),
       ...options,
     });
 

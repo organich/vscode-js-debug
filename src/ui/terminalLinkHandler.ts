@@ -2,11 +2,11 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { inject, injectable } from 'inversify';
 import { find as findLink } from 'linkifyjs';
 import { URL } from 'url';
 import * as vscode from 'vscode';
-import * as nls from 'vscode-nls';
 import {
   Configuration,
   DebugByLinkState,
@@ -16,9 +16,8 @@ import {
 import { DefaultBrowser, IDefaultBrowserProvider } from '../common/defaultBrowserProvider';
 import { DisposableList, IDisposable } from '../common/disposable';
 import { once } from '../common/objUtils';
+import { ITerminalLinkProvider } from '../common/terminalLinkProvider';
 import { isLoopbackIp, isMetaAddress } from '../common/urlUtils';
-
-const localize = nls.loadMessageBundle();
 
 interface ITerminalLink extends vscode.TerminalLink {
   target: URL;
@@ -31,9 +30,7 @@ const enum Protocol {
 }
 
 @injectable()
-export class TerminalLinkHandler
-  implements vscode.TerminalLinkProvider<ITerminalLink>, IDisposable
-{
+export class TerminalLinkHandler implements ITerminalLinkProvider<ITerminalLink>, IDisposable {
   private readonly enabledTerminals = new WeakSet<vscode.Terminal>();
   private readonly disposable = new DisposableList();
   private notifiedCantOpenOnWeb = false;
@@ -46,6 +43,7 @@ export class TerminalLinkHandler
           this.baseConfiguration = this.readConfig();
         }
       }),
+      vscode.window.registerTerminalLinkProvider(this),
     );
   }
 
@@ -109,9 +107,9 @@ export class TerminalLinkHandler
 
         // hack for https://github.com/Soapbox/linkifyjs/issues/317
         if (
-          uri.protocol === Protocol.Http &&
-          !link.value.startsWith(Protocol.Http) &&
-          !isLoopbackIp(uri.hostname)
+          uri.protocol === Protocol.Http
+          && !link.value.startsWith(Protocol.Http)
+          && !isLoopbackIp(uri.hostname)
         ) {
           uri.protocol = Protocol.Https;
         }
@@ -123,7 +121,7 @@ export class TerminalLinkHandler
         links.push({
           startIndex: start,
           length: link.value.length,
-          tooltip: localize('terminalLinkHover.debug', 'Debug URL'),
+          tooltip: l10n.t('Debug URL'),
           target: uri,
           workspaceFolder: getCwd()?.index,
         });
@@ -158,8 +156,7 @@ export class TerminalLinkHandler
       }
 
       vscode.window.showInformationMessage(
-        localize(
-          'cantOpenChromeOnWeb',
+        l10n.t(
           "We can't launch a browser in debug mode from here. If you want to debug this webpage, open this workspace from VS Code on your desktop.",
         ),
       );
@@ -181,10 +178,9 @@ export class TerminalLinkHandler
       // ignored
     }
 
-    const cwd =
-      terminal.workspaceFolder !== undefined
-        ? vscode.workspace.workspaceFolders?.[terminal.workspaceFolder]
-        : undefined;
+    const cwd = terminal.workspaceFolder !== undefined
+      ? vscode.workspace.workspaceFolders?.[terminal.workspaceFolder]
+      : undefined;
 
     vscode.debug.startDebugging(cwd, {
       ...this.baseConfiguration,

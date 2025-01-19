@@ -53,9 +53,9 @@ export class NodeTarget implements ITarget {
     this._cdp = cdp;
     cdp.pause();
     this._waitingForDebugger = targetInfo.type === 'waitingForDebugger';
-    if (targetInfo.title)
+    if (targetInfo.title) {
       this._targetName = `${basename(targetInfo.title)} [${targetInfo.processId}]`;
-    else this._targetName = `[${targetInfo.processId}]`;
+    } else this._targetName = `[${targetInfo.processId}]`;
 
     cdp.Target.on('targetDestroyed', () => this.connection.close());
     connection.onDisconnected(() => this._disconnected());
@@ -100,12 +100,16 @@ export class NodeTarget implements ITarget {
   }
 
   scriptUrlToUrl(url: string): string {
-    const isPath =
-      url[0] === '/' || (process.platform === 'win32' && url[1] === ':' && url[2] === '\\');
+    const isPath = url[0] === '/'
+      || (process.platform === 'win32' && url[1] === ':' && url[2] === '\\');
     return isPath ? absolutePathToFileUrl(url) : url;
   }
 
   supportsCustomBreakpoints(): boolean {
+    return false;
+  }
+
+  supportsXHRBreakpoints(): boolean {
     return false;
   }
 
@@ -151,14 +155,17 @@ export class NodeTarget implements ITarget {
     this._cdp.NodeWorker.enable({ waitForDebuggerOnStart: true });
 
     if (result && '__dynamicAttach' in result) {
-      await this._cdp.Debugger.enable({});
+      // order matters! The runtime must be enabled first so we know what
+      // execution contexts scripts are in
       await this._cdp.Runtime.enable({});
+      await this._cdp.Debugger.enable({});
     }
 
     let defaultCountextId: number;
     this._cdp.Runtime.on('executionContextCreated', event => {
-      if (event.context.auxData && event.context.auxData['isDefault'])
+      if (event.context.auxData && event.context.auxData['isDefault']) {
         defaultCountextId = event.context.id;
+      }
     });
     this._cdp.Runtime.on('executionContextDestroyed', event => {
       if (event.executionContextId === defaultCountextId) this.connection.close();

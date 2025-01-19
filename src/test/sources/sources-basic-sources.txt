@@ -8,8 +8,6 @@ Source event for inline
         sourceReference : <number>
     }
 }
-text/javascript
----------
 
 
     console.log('inline script');
@@ -25,8 +23,6 @@ Source event for empty.js
         sourceReference : <number>
     }
 }
-text/javascript
----------
 "111111111111111111111111111111111111111111111111111"
 
 ---------
@@ -41,8 +37,6 @@ Source event for does not exist
         sourceReference : <number>
     }
 }
-text/javascript
----------
 17
 //# sourceURL=http://localhost:8001/doesnotexist.js
 ---------
@@ -56,25 +50,7 @@ Source event for dir/helloworld
         sourceReference : <number>
     }
 }
-text/javascript
----------
 console.log('Hello, world!');
-
----------
-Evaluating#2: 42
-
-Source event for eval
-{
-    reason : new
-    source : {
-        name : <eval>/VM<xx>
-        path : <eval>/VM<xx>
-        sourceReference : <number>
-    }
-}
-text/javascript
----------
-42
 
 ---------
 
@@ -108,11 +84,6 @@ Loaded sources: {
         [5] : {
             name : localhost꞉8001/dir/helloworld.js
             path : ${workspaceFolder}/web/dir/helloworld.js
-            sourceReference : <number>
-        }
-        [6] : {
-            name : <eval>/VM<xx>
-            path : <eval>/VM<xx>
             sourceReference : <number>
         }
     ]

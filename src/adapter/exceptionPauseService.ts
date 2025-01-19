@@ -6,7 +6,7 @@ import { inject, injectable } from 'inversify';
 import Cdp from '../cdp/api';
 import { truthy } from '../common/objUtils';
 import { getDeferred } from '../common/promiseUtil';
-import { getSyntaxErrorIn } from '../common/sourceUtils';
+import { getSyntaxErrorIn, SourceConstants } from '../common/sourceUtils';
 import { AnyLaunchConfiguration } from '../configuration';
 import Dap from '../dap/api';
 import { IDapApi } from '../dap/connection';
@@ -15,7 +15,7 @@ import { ProtocolError } from '../dap/protocolError';
 import { wrapBreakCondition } from './breakpoints/conditions/expression';
 import { IEvaluator, PreparedCallFrameExpr } from './evaluator';
 import { IScriptSkipper } from './scriptSkipper/scriptSkipper';
-import { SourceContainer } from './sources';
+import { SourceContainer } from './sourceContainer';
 
 export interface IExceptionPauseService {
   readonly launchBlocker: Promise<void>;
@@ -114,8 +114,21 @@ export class ExceptionPauseService implements IExceptionPauseService {
    */
   public async shouldPauseAt(evt: Cdp.Debugger.PausedEvent) {
     if (
-      (evt.reason !== 'exception' && evt.reason !== 'promiseRejection') ||
-      this.state.cdp === PauseOnExceptionsState.None
+      (evt.reason !== 'exception' && evt.reason !== 'promiseRejection')
+      || this.state.cdp === PauseOnExceptionsState.None
+    ) {
+      return false;
+    }
+
+    // If there's an internal frame anywhere in the stack, this call is from
+    // some internally-executed script not visible for the user. Never pause
+    // if this results in an exception: the caller should handle it.
+    if (
+      evt.callFrames.some(cf =>
+        this.sourceContainer
+          .getSourceScriptById(cf.location.scriptId)
+          ?.url.endsWith(SourceConstants.InternalExtension)
+      )
     ) {
       return false;
     }
@@ -155,7 +168,10 @@ export class ExceptionPauseService implements IExceptionPauseService {
   }
 
   private async evalCondition(evt: Cdp.Debugger.PausedEvent, method: PreparedCallFrameExpr) {
-    const r = await method({ callFrameId: evt.callFrames[0].callFrameId }, { error: evt.data });
+    const r = await method(
+      { callFrameId: evt.callFrames[0].callFrameId },
+      v => v === 'error' ? evt.data : undefined,
+    );
     return !!r?.result.value;
   }
 
@@ -218,13 +234,12 @@ export class ExceptionPauseService implements IExceptionPauseService {
         return undefined;
       }
 
-      const expr =
-        '!!(' +
-        filters
+      const expr = '!!('
+        + filters
           .map(f => f.condition)
           .filter(truthy)
-          .join(') || !!(') +
-        ')';
+          .join(') || !!(')
+        + ')';
 
       const err = getSyntaxErrorIn(expr);
       if (err) {
@@ -233,7 +248,7 @@ export class ExceptionPauseService implements IExceptionPauseService {
         );
       }
 
-      const wrapped = this.breakOnError ? wrapBreakCondition(expr) : expr;
+      const wrapped = wrapBreakCondition(expr, this.breakOnError);
       return this.evaluator.prepare(wrapped, { hoist: ['error'] }).invoke;
     };
 

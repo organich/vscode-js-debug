@@ -2,19 +2,20 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import { EncodedSourceMap, SectionedSourceMap } from '@jridgewell/trace-mapping';
 import { expect } from 'chai';
-import dataUriToBuffer from 'data-uri-to-buffer';
+import { dataUriToBuffer } from 'data-uri-to-buffer';
 import { stub } from 'sinon';
-import { RawIndexMap, RawSourceMap } from 'source-map';
+import { IResourceProvider } from '../../adapter/resourceProvider';
 import { stubbedDapApi, StubDapApi } from '../../dap/stubbedApi';
 import { Logger } from '../logging/logger';
-import { RawIndexMapUnresolved, SourceMapFactory } from './sourceMapFactory';
+import { RootSourceMapFactory, UnresolvedSourceMap } from './sourceMapFactory';
 
 const toDataUri = (obj: unknown) =>
   'data:application/json;base64,' + Buffer.from(JSON.stringify(obj)).toString('base64');
 
 const sampleSource = 'console.log(123)';
-const basicSourceMap: RawSourceMap = {
+const basicSourceMap: EncodedSourceMap = {
   version: 3,
   sources: ['one.js'],
   sourcesContent: [sampleSource],
@@ -22,7 +23,7 @@ const basicSourceMap: RawSourceMap = {
   file: '',
   mappings: '',
 };
-const indexedSourceMap: RawIndexMap = {
+const indexedSourceMap: SectionedSourceMap = {
   version: 3,
   sections: [
     {
@@ -31,7 +32,7 @@ const indexedSourceMap: RawIndexMap = {
     },
   ],
 };
-const unresolvedIndexedSourceMap: RawIndexMapUnresolved = {
+const unresolvedIndexedSourceMap: UnresolvedSourceMap = {
   version: 3,
   sections: [
     {
@@ -43,11 +44,26 @@ const unresolvedIndexedSourceMap: RawIndexMapUnresolved = {
 
 describe('SourceMapFactory', () => {
   let stubDap: StubDapApi;
-  let factory: SourceMapFactory;
+  let factory: RootSourceMapFactory;
+  let resourceProvider: IResourceProvider;
 
   beforeEach(() => {
     stubDap = stubbedDapApi();
-    factory = new SourceMapFactory(
+    resourceProvider = {
+      fetch(url) {
+        return Promise.resolve({
+          ok: true,
+          body: Buffer.from(dataUriToBuffer(url).buffer).toString('utf8'),
+          url: url,
+          statusCode: 200,
+        });
+      },
+      fetchJson<T>() {
+        return Promise.resolve({ ok: true, body: {} as T, url: '', statusCode: 200 });
+      },
+    };
+
+    factory = new RootSourceMapFactory(
       {
         rebaseRemoteToLocal() {
           return '/tmp/local';
@@ -65,26 +81,13 @@ describe('SourceMapFactory', () => {
           return undefined;
         },
       },
-      {
-        fetch(url) {
-          return Promise.resolve({
-            ok: true,
-            body: dataUriToBuffer(url).toString('utf8'),
-            url: url,
-            statusCode: 500,
-          });
-        },
-        fetchJson<T>() {
-          return Promise.resolve({ ok: true, body: {} as T, url: '', statusCode: 200 });
-        },
-      },
       stubDap.actual,
       Logger.null,
     );
   });
 
   it('loads indexed source-maps', async () => {
-    const map = await factory.load({
+    const map = await factory.load(resourceProvider, {
       sourceMapUrl: toDataUri(indexedSourceMap),
       compiledPath: '/tmp/local/one.js',
     });
@@ -93,7 +96,7 @@ describe('SourceMapFactory', () => {
   });
 
   it('loads indexed source-maps with unresolved children', async () => {
-    const map = await factory.load({
+    const map = await factory.load(resourceProvider, {
       sourceMapUrl: toDataUri(unresolvedIndexedSourceMap),
       compiledPath: '/tmp/local/one.js',
     });
@@ -103,7 +106,7 @@ describe('SourceMapFactory', () => {
 
   it('warns without failure if a single nested child fails', async () => {
     const warn = stub(Logger.null, 'warn');
-    const map = await factory.load({
+    const map = await factory.load(resourceProvider, {
       sourceMapUrl: toDataUri({
         ...unresolvedIndexedSourceMap,
         sections: [

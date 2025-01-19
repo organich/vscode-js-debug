@@ -9,6 +9,7 @@ import { itIntegrates } from '../testIntegrationUtils';
 describe('completion', () => {
   const tcases: [string, Dap.CompletionItem[]][] = [
     ['ar|', [{ label: 'arr', sortText: '~~arr', type: 'variable', detail: 'Array' }]],
+    ['ar|.length', [{ label: 'arr', sortText: '~~arr', type: 'variable', detail: 'Array' }]],
     [
       'arr.|',
       [
@@ -33,6 +34,27 @@ describe('completion', () => {
           detail: 'fn(?)',
           sortText: '~~~at',
           type: 'method',
+        },
+      ],
+    ],
+    [
+      'arr.len|',
+      [
+        {
+          label: '[index]',
+          text: '[index]',
+          type: 'property',
+          sortText: '~~[',
+          length: 1,
+          selectionLength: 5,
+          selectionStart: 1,
+          start: 3,
+        },
+        {
+          label: 'length',
+          detail: '3',
+          sortText: '~~length',
+          type: 'property',
         },
       ],
     ],
@@ -89,7 +111,11 @@ describe('completion', () => {
       'arr[myStr|',
       [{ label: 'myString', sortText: '~~myString', type: 'variable', detail: 'string' }],
     ],
-    ['const replVar = 42; replV|', [{ label: 'replVar', sortText: 'replVar', type: 'variable' }]],
+    ['const replVar = 42; replV|', [{
+      label: 'replVar',
+      sortText: 'replVar',
+      type: 'variable',
+    }]],
     [
       'MyCoolCl|',
       [{ label: 'MyCoolClass', sortText: '~~MyCoolClass', type: 'class', detail: 'fn()' }],
@@ -162,7 +188,12 @@ describe('completion', () => {
           detail: 'true',
         },
         { label: 'constructor', sortText: '~~~constructor', type: 'class', detail: 'fn(?)' },
-        { label: 'hasOwnProperty', sortText: '~~~hasOwnProperty', type: 'method', detail: 'fn(?)' },
+        {
+          label: 'hasOwnProperty',
+          sortText: '~~~hasOwnProperty',
+          type: 'method',
+          detail: 'fn(?)',
+        },
       ],
     ],
     ['$returnV|', []],

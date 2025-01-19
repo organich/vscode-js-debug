@@ -7,20 +7,24 @@ import { extname, resolve } from 'path';
 import { IBreakpointsPredictor } from '../../adapter/breakpointPredictor';
 import { IPortLeaseTracker } from '../../adapter/portLeaseTracker';
 import Cdp from '../../cdp/api';
-import { asArray } from '../../common/arrayUtils';
+import { asArray, iteratorFirst } from '../../common/arrayUtils';
 import { DebugType } from '../../common/contributionUtils';
 import { IFsUtils, LocalFsUtils } from '../../common/fsUtils';
 import { ILogger, LogTag } from '../../common/logging';
 import { fixDriveLetterAndSlashes } from '../../common/pathUtils';
 import { delay } from '../../common/promiseUtil';
-import { ISourceMapMetadata } from '../../common/sourceMaps/sourceMap';
 import { absolutePathToFileUrl, urlToRegex } from '../../common/urlUtils';
 import { AnyLaunchConfiguration, INodeLaunchConfiguration } from '../../configuration';
 import { fixInspectFlags } from '../../ui/configurationUtils';
 import { retryGetNodeEndpoint } from '../browser/spawn/endpoints';
 import { ISourcePathResolverFactory } from '../sourcePathResolverFactory';
 import { CallbackFile } from './callback-file';
-import { getRunScript, hideDebugInfoFromConsole, INodeBinaryProvider } from './nodeBinaryProvider';
+import {
+  Capability,
+  getRunScript,
+  hideDebugInfoFromConsole,
+  INodeBinaryProvider,
+} from './nodeBinaryProvider';
 import { IProcessTelemetry, IRunData, NodeLauncherBase } from './nodeLauncherBase';
 import { INodeTargetLifecycleHooks } from './nodeTarget';
 import { IPackageJsonProvider } from './packageJsonProvider';
@@ -144,6 +148,16 @@ export class NodeLauncher extends NodeLauncherBase<INodeLaunchConfiguration> {
       }
 
       const options: INodeLaunchConfiguration = { ...runData.params, env: env.value };
+      const experimentalNetworkFlag = '--experimental-network-inspection';
+      if (runData.params.experimentalNetworking === 'off') {
+        // no-op
+      } else if (
+        binary.has(Capability.UseExperimentalNetworking)
+        || runData.params.experimentalNetworking === 'on'
+      ) {
+        options.runtimeArgs = [experimentalNetworkFlag, ...options.runtimeArgs];
+      }
+
       const launcher = this.launchers.find(l => l.canLaunch(options));
       if (!launcher) {
         throw new Error('Cannot find an appropriate launcher for the given set of options');
@@ -305,7 +319,7 @@ export class NodeLauncher extends NodeLauncherBase<INodeLaunchConfiguration> {
 
     // There can be more than one compile file per source file. Just pick
     // whichever one in that case.
-    const entry: ISourceMapMetadata = mapped.values().next().value;
+    const entry = iteratorFirst(mapped.values());
     if (!entry) {
       return targetProgram;
     }

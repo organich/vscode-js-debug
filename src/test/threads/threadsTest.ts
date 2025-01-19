@@ -2,6 +2,7 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import { delay } from '../../common/promiseUtil';
 import { TestP, TestRoot } from '../test';
 import { itIntegrates } from '../testIntegrationUtils';
 
@@ -156,7 +157,8 @@ describe('threads', () => {
 
     const runCrossThreadTest = async (r: TestRoot, p: TestP) => {
       p.cdp.Runtime.evaluate({
-        expression: `debugger;\nwindow.w = new Worker('workerSourceMap.js');\n//# sourceURL=test.js`,
+        expression:
+          `debugger;\nwindow.w = new Worker('workerSourceMap.js');\n//# sourceURL=test.js`,
       });
       const { threadId } = p.log(await p.dap.once('stopped'));
       await p.logger.logStackTrace(threadId);
@@ -262,6 +264,25 @@ describe('threads', () => {
       p.evaluate(`new Promise((res, rej) => rej(new Error('oh no!'))).catch(err => {})`);
       await waitForPauseOnException(p);
 
+      p.assertLog();
+    });
+
+    itIntegrates('does not pause on exceptions in internals', async ({ r }) => {
+      const p = await r.launchAndLoad('blank');
+
+      await p.dap.setExceptionBreakpoints({ filters: ['all'] });
+      const e = p.evaluate(
+        `console.log({ [Symbol.for('debug.description')]() { throw 'oops'; } })`,
+      );
+
+      await Promise.race([
+        p.dap.once('stopped').then(() => {
+          throw new Error('should not stop');
+        }),
+        delay(1000),
+      ]);
+
+      await e;
       p.assertLog();
     });
 

@@ -2,35 +2,33 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import { createGlobalContainer, createTopLevelSessionContainer } from './ioc';
-
+import * as l10n from '@vscode/l10n';
 import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import * as net from 'net';
-import { Binder, IBinderDelegate } from './binder';
-import DapConnection from './dap/connection';
+import * as os from 'os';
+import * as path from 'path';
 import { DebugAdapter } from './adapter/debugAdapter';
-import Dap from './dap/api';
+import { Binder, IBinderDelegate } from './binder';
 import { IDisposable } from './common/disposable';
-import * as nls from 'vscode-nls';
-import { TargetOrigin } from './targets/targetOrigin';
 import { ILogger } from './common/logging';
+import Dap from './dap/api';
+import DapConnection from './dap/connection';
 import { StreamDapTransport } from './dap/transport';
-
-const localize = nls.loadMessageBundle();
+import { createGlobalContainer, createTopLevelSessionContainer } from './ioc';
+import { TargetOrigin } from './targets/targetOrigin';
 
 const storagePath = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-js-debug-'));
 
 class Configurator {
   private _setExceptionBreakpointsParams?: Dap.SetExceptionBreakpointsParams;
   private _setBreakpointsParams: { params: Dap.SetBreakpointsParams; ids: number[] }[];
-  private _customBreakpoints = new Set<string>();
+  private _customBreakpoints: string[] = [];
+  private _xhrBreakpoints: string[] = [];
   private lastBreakpointId = 0;
 
-  constructor(dapPromise: Promise<Dap.Api>) {
+  constructor(dap: Dap.Api) {
     this._setBreakpointsParams = [];
-    dapPromise.then(dap => this._listen(dap));
+    this._listen(dap);
   }
 
   _listen(dap: Dap.Api) {
@@ -40,7 +38,7 @@ class Configurator {
       const breakpoints = ids.map(id => ({
         id,
         verified: false,
-        message: localize('breakpoint.provisionalBreakpoint', `Unbound breakpoint`),
+        message: l10n.t('Unbound breakpoint'),
       })); // TODO: Put a useful message here
       return { breakpoints };
     });
@@ -50,13 +48,9 @@ class Configurator {
       return {};
     });
 
-    dap.on('enableCustomBreakpoints', async params => {
-      for (const id of params.ids) this._customBreakpoints.add(id);
-      return {};
-    });
-
-    dap.on('disableCustomBreakpoints', async params => {
-      for (const id of params.ids) this._customBreakpoints.delete(id);
+    dap.on('setCustomBreakpoints', async params => {
+      this._customBreakpoints = params.ids;
+      this._xhrBreakpoints = params.xhr;
       return {};
     });
 
@@ -74,11 +68,16 @@ class Configurator {
   }
 
   async configure(adapter: DebugAdapter) {
-    if (this._setExceptionBreakpointsParams)
+    if (this._setExceptionBreakpointsParams) {
       await adapter.setExceptionBreakpoints(this._setExceptionBreakpointsParams);
-    for (const { params, ids } of this._setBreakpointsParams)
+    }
+    for (const { params, ids } of this._setBreakpointsParams) {
       await adapter.breakpointManager.setBreakpoints(params, ids);
-    await adapter.enableCustomBreakpoints({ ids: Array.from(this._customBreakpoints) });
+    }
+    await adapter.setCustomBreakpoints({
+      xhr: this._xhrBreakpoints,
+      ids: this._customBreakpoints,
+    });
     await adapter.configurationDone();
   }
 }

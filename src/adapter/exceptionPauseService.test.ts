@@ -14,7 +14,7 @@ import { assertNotResolved, assertResolved } from '../test/asserts';
 import { IEvaluator } from './evaluator';
 import { ExceptionPauseService, PauseOnExceptionsState } from './exceptionPauseService';
 import { ScriptSkipper } from './scriptSkipper/implementation';
-import { SourceContainer } from './sources';
+import { SourceContainer } from './sourceContainer';
 
 describe('ExceptionPauseService', () => {
   let prepareEval: SinonStub;
@@ -35,7 +35,7 @@ describe('ExceptionPauseService', () => {
       upcastPartial<ScriptSkipper>({ isScriptSkipped }),
       stubDap as unknown as Dap.Api,
       upcastPartial<AnyLaunchConfiguration>({}),
-      upcastPartial<SourceContainer>({ getScriptById }),
+      upcastPartial<SourceContainer>({ getScriptById, getSourceScriptById: getScriptById }),
     );
   });
 
@@ -117,7 +117,10 @@ describe('ExceptionPauseService', () => {
       filters: [],
       filterOptions: [{ filterId: PauseOnExceptionsState.All, condition: 'error.name == "hi"' }],
     });
-    expect(prepareEval.args[0]).to.deep.equal(['!!(error.name == "hi")', { hoist: ['error'] }]);
+    expect(prepareEval.args[0]).to.deep.equal([
+      '(()=>{try{return !!(error.name == "hi");}catch(e){console.error(`Breakpoint condition error: ${e.message||e}`);return false}})()',
+      { hoist: ['error'] },
+    ]);
     expect(stubDap.output.called).to.be.false;
     expect(stubCdp.Debugger.setPauseOnExceptions.calledWith({ state: 'all' })).to.be.true;
 

@@ -2,11 +2,11 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import { xxHash32 } from 'js-xxhash';
+import { basename } from 'path';
 import { FileGlobList } from '../fileGlobList';
-import { readfile, stat } from '../fsUtils';
+import { readfile } from '../fsUtils';
 import { parseSourceMappingUrl } from '../sourceUtils';
-import { absolutePathToFileUrl, completeUrl, fileUrlToAbsolutePath, isDataUri } from '../urlUtils';
+import { absolutePathToFileUrl, completeUrl, isDataUri } from '../urlUtils';
 import { ISourceMapMetadata } from './sourceMap';
 
 /**
@@ -19,16 +19,36 @@ export interface IRelativePattern {
 
 export const ISearchStrategy = Symbol('ISearchStrategy');
 
+// todo@connor4312: fallback search strategy during turbo mode's beta
+export const ISearchStrategyFallback = Symbol('ISearchStrategyFallback');
+
+export interface ISourcemapStreamOptions<T, R> {
+  /** List of files to find. */
+  files: FileGlobList;
+  /** First search for processing source map data from disk. T must be JSON-serializable. */
+  processMap: (child: Required<ISourceMapMetadata>) => T | Promise<T>;
+  /** Second step to handle a processed map. `data` may have been read from cache. */
+  onProcessedMap: (data: T) => R | Promise<R>;
+  /**
+   * Optionally filter for processed files. Only files matching this pattern
+   * will have the mtime checked, and _may_ result in onProcessedMap calls.
+   */
+  filter?: (path: string, child?: T) => boolean;
+  /** Last cache state, passing it may speed things up. */
+  lastState?: unknown;
+}
+
 export interface ISearchStrategy {
   /**
-   * Recursively finds all children matching the outFiles, calling `onChild`
-   * when children are found and returning a promise that resolves once all
-   * children have been discovered.
+   * Recursively finds all children matching the outFiles. Calls `processMap`
+   * when it encounters new files, then `onProcessedMap` with the result of
+   * doing so. `onProcessedMap` may be called with previously-cached data.
+   *
+   * Takes and can return a `state` value to make subsequent searches faster.
    */
-  streamChildrenWithSourcemaps<T>(
-    files: FileGlobList,
-    onChild: (child: Required<ISourceMapMetadata>) => T | Promise<T>,
-  ): Promise<T[]>;
+  streamChildrenWithSourcemaps<T, R>(
+    opts: ISourcemapStreamOptions<T, R>,
+  ): Promise<{ values: R[]; state: unknown }>;
 
   /**
    * Recursively finds all children, calling `onChild` when children are found
@@ -47,13 +67,21 @@ export interface ISearchStrategy {
  */
 export const createMetadataForFile = async (
   compiledPath: string,
+  metadata: { siblings: readonly string[]; mtime: number },
   fileContents?: string,
 ): Promise<Required<ISourceMapMetadata> | undefined> => {
-  if (typeof fileContents === 'undefined') {
-    fileContents = await readfile(compiledPath);
+  let sourceMapUrl;
+  const compiledFileName = basename(compiledPath);
+  const maybeSibling = `${compiledFileName}.map`;
+  if (metadata.siblings.includes(maybeSibling)) {
+    sourceMapUrl = maybeSibling;
   }
-
-  let sourceMapUrl = parseSourceMappingUrl(fileContents);
+  if (!sourceMapUrl) {
+    if (typeof fileContents === 'undefined') {
+      fileContents = await readfile(compiledPath);
+    }
+    sourceMapUrl = parseSourceMappingUrl(fileContents);
+  }
   if (!sourceMapUrl) {
     return;
   }
@@ -71,20 +99,9 @@ export const createMetadataForFile = async (
     return;
   }
 
-  let cacheKey: number;
-  if (smIsDataUri) {
-    cacheKey = xxHash32(sourceMapUrl);
-  } else {
-    const stats = await stat(fileUrlToAbsolutePath(sourceMapUrl) || compiledPath);
-    if (!stats) {
-      return; // ENOENT, usually
-    }
-    cacheKey = stats.mtimeMs;
-  }
-
   return {
     compiledPath,
     sourceMapUrl,
-    cacheKey,
+    cacheKey: metadata.mtime,
   };
 };

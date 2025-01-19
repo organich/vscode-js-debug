@@ -2,13 +2,12 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import execa from 'execa';
 import { promises as fs } from 'fs';
 import { marked } from 'marked';
-import { format } from 'prettier';
-import { prettier as prettierOpts } from '../../package.json';
+import strings from '../../package.nls.json';
 import { getPreferredOrDebugType } from '../common/contributionUtils';
 import { debuggers, DescribedAttribute } from './generate-contributions.js';
-import strings from './strings';
 
 (async () => {
   let out = `# Options\n\n`;
@@ -17,16 +16,17 @@ import strings from './strings';
     out += `<details>`;
 
     const entries = Object.entries(dbg.configurationAttributes).sort(([a], [b]) =>
-      a.localeCompare(b),
+      a.localeCompare(b)
     );
     for (const [key, value] of entries as Iterable<[string, DescribedAttribute<unknown>]>) {
-      const descriptionKeyRaw =
-        'markdownDescription' in value ? value.markdownDescription : value.description;
+      const descriptionKeyRaw = 'markdownDescription' in value
+        ? value.markdownDescription
+        : value.description;
       if (!descriptionKeyRaw) {
         continue;
       }
 
-      const descriptionKey = descriptionKeyRaw.slice(1, -1) as keyof typeof strings;
+      const descriptionKey = descriptionKeyRaw.slice(1, -1);
       const description = strings[descriptionKey].replace(/\n/g, '<br>');
       if (!description) {
         continue;
@@ -42,11 +42,6 @@ import strings from './strings';
     out += `</details>\n\n`;
   }
 
-  await fs.writeFile(
-    'OPTIONS.md',
-    format(out, {
-      parser: 'markdown',
-      ...prettierOpts,
-    }),
-  );
+  await fs.writeFile('OPTIONS.md', out);
+  await execa('node_modules/.bin/dprint', ['fmt', 'OPTIONS.md']);
 })().catch(console.error);

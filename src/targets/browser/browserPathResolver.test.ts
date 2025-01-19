@@ -59,6 +59,7 @@ describe('BrowserPathResolver', () => {
       testVueMapper,
       fsUtils,
       {
+        workspaceFolder: testFixturesDir,
         pathMapping: { '/': path.join(testFixturesDir, 'web') },
         clientID: 'vscode',
         baseUrl: 'http://localhost:1234/',
@@ -110,7 +111,7 @@ describe('BrowserPathResolver', () => {
         new FileGlobList({ rootPath: testFixturesDir, patterns: ['**/*.vue'] }),
         {
           streamChildrenWithSourcemaps() {
-            return Promise.resolve([]);
+            return Promise.resolve({ values: [], state: undefined });
           },
           streamAllChildren(_files, onChild) {
             return Promise.all([
@@ -162,6 +163,7 @@ describe('BrowserPathResolver', () => {
         testVueMapper,
         fsUtils,
         {
+          workspaceFolder: testFixturesDir,
           pathMapping: {
             '/': path.join(testFixturesDir, 'web'),
             '/sibling': path.join(testFixturesDir, 'sibling-dir'),
@@ -203,8 +205,8 @@ describe('BrowserPathResolver', () => {
     it('matches any path if no baseUrl is present', () => {
       const filePath = path.join(testFixturesDir, 'web', 'foo.js');
       expect(resolver({ baseUrl: undefined }).absolutePathToUrlRegexp(filePath)).to.equal(
-        urlToRegex(absolutePathToFileUrl(filePath)) +
-          '|[hH][tT][tT][pP][sS]?:\\/\\/[^\\/]+\\/[fF][oO][oO]\\.[jJ][sS]($|\\?)',
+        urlToRegex(absolutePathToFileUrl(filePath))
+          + '|[hH][tT][tT][pP][sS]?:\\/\\/[^\\/]+\\/[fF][oO][oO]\\.[jJ][sS]($|\\?)',
       );
     });
 
@@ -239,6 +241,7 @@ describe('BrowserPathResolver', () => {
         testVueMapper,
         new FakeLocalFsUtils() as IFsUtils,
         {
+          workspaceFolder: testFixturesDir,
           pathMapping: { '/': webRoot },
           clientID: client,
           baseUrl: 'http://localhost:60318/',
@@ -254,7 +257,7 @@ describe('BrowserPathResolver', () => {
       const url = 'webpack:///src/app/app.component.html';
       const absolutePath = await resolver.urlToAbsolutePath({
         url,
-        map: upcastPartial<SourceMap>({ metadata: { sourceMapUrl: '', compiledPath: '' } }),
+        map: upcastPartial<SourceMap>({ metadata: { sourceMapUrl: '', compiledPath: 'x' } }),
       });
 
       expect(absolutePath).to.equal(

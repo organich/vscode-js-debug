@@ -7,11 +7,15 @@ import { promises as fsPromises } from 'fs';
 import { CancellationToken } from 'vscode';
 import CdpConnection from '../../cdp/connection';
 import { WebSocketTransport } from '../../cdp/webSocketTransport';
+import { IDisposable } from '../../common/disposable';
 import { EnvironmentVars } from '../../common/environmentVars';
 import { canAccess } from '../../common/fsUtils';
 import { ILogger, LogTag } from '../../common/logging';
+import { formatSubprocessArguments } from '../../common/processUtils';
 import { delay } from '../../common/promiseUtil';
 import Dap from '../../dap/api';
+import { browserProcessExitedBeforePort } from '../../dap/errors';
+import { ProtocolError } from '../../dap/protocolError';
 import { ITelemetryReporter } from '../../telemetry/telemetryReporter';
 import { BrowserArgs } from './browserArgs';
 import { IDapInitializeParamsWithExtensions } from './browserLauncher';
@@ -46,7 +50,8 @@ interface ILaunchOptions {
 }
 
 export interface ILaunchResult {
-  cdp: CdpConnection;
+  canReconnect: boolean;
+  createConnection(cancellationToken: CancellationToken): Promise<CdpConnection>;
   process: IBrowserProcess;
 }
 
@@ -106,10 +111,17 @@ export async function launch(
   } else {
     logger.info(LogTag.RuntimeLaunch, `Launching Chrome from ${executablePath}`);
 
-    const cp = childProcess.spawn(executablePath, browserArguments.toArray(), {
+    const formatted = formatSubprocessArguments(
+      executablePath,
+      browserArguments.toArray(),
+      (await canAccess(fsPromises, cwd)) ? cwd : process.cwd(),
+    );
+
+    const cp = childProcess.spawn(formatted.executable, formatted.args, {
       detached: true,
       env: env.defined(),
-      cwd: (await canAccess(fsPromises, cwd)) ? cwd : process.cwd(),
+      shell: formatted.shell,
+      cwd: formatted.cwd,
       stdio,
     }) as childProcess.ChildProcessWithoutNullStreams;
 
@@ -133,7 +145,7 @@ export async function launch(
     browserProcess.stdout?.resume();
   }
 
-  let exitListener = () => {
+  const exitListener = () => {
     if (cleanUp === 'wholeBrowser') {
       browserProcess.kill();
     }
@@ -143,30 +155,37 @@ export async function launch(
 
   try {
     if (options.promisedPort) {
-      actualConnection = await options.promisedPort;
+      let listener: IDisposable;
+
+      actualConnection = await Promise.race([
+        options.promisedPort,
+        new Promise<never>((_resolve, reject) => {
+          listener = browserProcess.onExit(code => {
+            reject(new ProtocolError(browserProcessExitedBeforePort(code)));
+          });
+        }),
+      ]).finally(() => listener.dispose());
     }
 
-    const transport = await browserProcess.transport(
-      {
-        connection: actualConnection,
-        inspectUri: inspectUri || undefined,
-        url: url || undefined,
-      },
-      cancellationToken,
-    );
+    return {
+      process: browserProcess,
+      // can only reconnect to debug ports, not pipe connections:
+      canReconnect: typeof actualConnection === 'number',
+      createConnection: async cancellationToken => {
+        const transport = await browserProcess.transport(
+          {
+            connection: actualConnection!,
+            inspectUri: inspectUri || undefined,
+            url: url || undefined,
+          },
+          cancellationToken,
+        );
 
-    const cdp = new CdpConnection(transport, logger, telemetryReporter);
-    exitListener = async () => {
-      if (cleanUp === 'wholeBrowser') {
-        await cdp.rootSession().Browser.close({});
-        browserProcess.kill();
-      } else {
-        cdp.close();
-      }
+        return new CdpConnection(transport, logger, telemetryReporter);
+      },
     };
-    return { cdp: cdp, process: browserProcess };
   } catch (e) {
-    exitListener();
+    browserProcess.kill();
     throw e;
   }
 }

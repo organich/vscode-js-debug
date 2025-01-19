@@ -2,15 +2,13 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import * as nls from 'vscode-nls';
+import * as l10n from '@vscode/l10n';
 import Cdp from '../../cdp/api';
 import { getDeferred } from '../../common/promiseUtil';
 import Dap from '../../dap/api';
 import { BreakpointManager } from '../breakpoints';
 import { Breakpoint, BreakpointCdpReference, CdpReferenceState } from './breakpointBase';
 import { IBreakpointCondition } from './conditions';
-
-const localize = nls.loadMessageBundle();
 
 export class UserDefinedBreakpoint extends Breakpoint {
   /**
@@ -40,11 +38,11 @@ export class UserDefinedBreakpoint extends Breakpoint {
    */
   public equivalentTo(other: UserDefinedBreakpoint) {
     return (
-      other.dapParams.column === this.dapParams.column &&
-      other.dapParams.line === this.dapParams.line &&
-      other.dapParams.hitCondition === this.dapParams.hitCondition &&
-      other.dapParams.condition === this.dapParams.condition &&
-      other.dapParams.logMessage === this.dapParams.logMessage
+      other.dapParams.column === this.dapParams.column
+      && other.dapParams.line === this.dapParams.line
+      && other.dapParams.hitCondition === this.dapParams.hitCondition
+      && other.dapParams.condition === this.dapParams.condition
+      && other.dapParams.logMessage === this.dapParams.logMessage
     );
   }
 
@@ -89,7 +87,7 @@ export class UserDefinedBreakpoint extends Breakpoint {
     return {
       id: this.dapId,
       verified: false,
-      message: localize('breakpoint.provisionalBreakpoint', `Unbound breakpoint`), // TODO: Put a useful message here
+      message: l10n.t('Unbound breakpoint'), // TODO: Put a useful message here
     };
   }
 
@@ -143,6 +141,7 @@ export class UserDefinedBreakpoint extends Breakpoint {
    * used for statistics and notifying the UI.
    */
   private async notifyResolved(): Promise<void> {
-    await this._manager.notifyBreakpointChange(this, this.completedSet.hasSettled());
+    await this.completedSet.promise;
+    await this._manager.notifyBreakpointChange(this, true);
   }
 }

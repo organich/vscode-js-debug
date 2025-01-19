@@ -2,12 +2,34 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import { randomBytes } from 'crypto';
 import execa from 'execa';
+import { tmpdir } from 'os';
 import * as path from 'path';
 import { FsPromises } from '../ioc-extras';
 import { EnvironmentVars } from './environmentVars';
 import { existsInjected } from './fsUtils';
 import { removeNulls } from './objUtils';
+
+/** Platform-specific path for named sockets */
+export const namedSocketDirectory = process.platform === 'win32' ? '\\\\.\\pipe\\' : tmpdir();
+
+let pipeCounter = 0;
+
+export const getRandomPipe = () =>
+  path.join(
+    namedSocketDirectory,
+    `node-cdp.${process.pid}-${randomBytes(4).toString('hex')}-${pipeCounter++}.sock`,
+  );
+
+function pathExtensions(env: EnvironmentVars) {
+  if (process.platform !== 'win32') {
+    return [''];
+  }
+
+  const pathExts = env.lookup('PATHEXT');
+  return pathExts?.split(';') || ['.exe'];
+}
 
 /*
  * Lookup the given program on the PATH and return its absolute path on success and undefined otherwise.
@@ -74,14 +96,10 @@ export async function findExecutable(
   }
 
   if (process.platform === 'win32' && !path.extname(program)) {
-    const pathExtension = env.lookup('PATHEXT');
-    if (pathExtension) {
-      const executableExtensions = pathExtension.split(';');
-      for (const extension of executableExtensions) {
-        const path = program + extension;
-        if (await existsInjected(fs, path)) {
-          return path;
-        }
+    for (const extension of pathExtensions(env)) {
+      const path = program + extension;
+      if (await existsInjected(fs, path)) {
+        return path;
       }
     }
   }
@@ -140,12 +158,20 @@ export function properRelative(fromPath: string, toPath: string): string {
   }
 }
 
+const splitRe = /\/|\\/;
+const fileUriPrefix = 'file:///';
+
+const isWindowsFileUri = (aPath: string) =>
+  aPath.startsWith(fileUriPrefix) && aPath[fileUriPrefix.length + 1] === ':';
+
+export const properSplit = (path: string) => path.split(splitRe);
+
 export function fixDriveLetter(aPath: string, uppercaseDriveLetter = false): string {
   if (!aPath) return aPath;
 
-  if (aPath.match(/file:\/\/\/[A-Za-z]:/)) {
-    const prefixLen = 'file:///'.length;
-    aPath = 'file:///' + aPath[prefixLen].toLowerCase() + aPath.substr(prefixLen + 1);
+  if (isWindowsFileUri(aPath)) {
+    const prefixLen = fileUriPrefix.length;
+    aPath = fileUriPrefix + aPath[prefixLen].toLowerCase() + aPath.substr(prefixLen + 1);
   } else if (isWindowsPath(aPath)) {
     // If the path starts with a drive letter, ensure lowercase. VS Code uses a lowercase drive letter
     const driveLetter = uppercaseDriveLetter ? aPath[0].toUpperCase() : aPath[0].toLowerCase();
@@ -162,8 +188,8 @@ export function fixDriveLetterAndSlashes(aPath: string, uppercaseDriveLetter = f
   if (!aPath) return aPath;
 
   aPath = fixDriveLetter(aPath, uppercaseDriveLetter);
-  if (aPath.match(/file:\/\/\/[A-Za-z]:/)) {
-    const prefixLen = 'file:///'.length;
+  if (isWindowsFileUri(aPath)) {
+    const prefixLen = fileUriPrefix.length;
     aPath = aPath.substr(0, prefixLen + 1) + aPath.substr(prefixLen + 1).replace(/\//g, '\\');
   } else if (isWindowsPath(aPath)) {
     aPath = aPath.replace(/\//g, '\\');

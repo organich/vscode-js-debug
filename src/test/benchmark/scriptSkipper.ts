@@ -4,16 +4,19 @@
 
 import { IBenchmarkApi } from '@c4312/matcha';
 import { ScriptSkipper } from '../../adapter/scriptSkipper/implementation';
-import { Source } from '../../adapter/sources';
+import { Source } from '../../adapter/source';
 import Connection from '../../cdp/connection';
 import { NullTransport } from '../../cdp/nullTransport';
 import { Logger } from '../../common/logging/logger';
+import { upcastPartial } from '../../common/objUtils';
+import { ISourcePathResolver } from '../../common/sourcePathResolver';
 import { AnyLaunchConfiguration } from '../../configuration';
 import { ITarget } from '../../targets/targets';
 import { NullTelemetryReporter } from '../../telemetry/nullTelemetryReporter';
 
 const skipper = new ScriptSkipper(
   { skipFiles: ['<node_internals>/**', '/foo/*.js'] } as unknown as AnyLaunchConfiguration,
+  upcastPartial<ISourcePathResolver>({ rebaseLocalToRemote: p => p }),
   Logger.null,
   new Connection(new NullTransport(), Logger.null, new NullTelemetryReporter()).createSession(''),
   {
@@ -35,12 +38,14 @@ const isSkipped = {
   scriptIds: () => ['42'],
 } as Partial<Source> as Source;
 
-export default function (api: IBenchmarkApi) {
-  api.bench('initializeSkippingValueForSource not skipped', () =>
-    skipper.initializeSkippingValueForSource(notSkipped),
+export default function(api: IBenchmarkApi) {
+  api.bench(
+    'initializeSkippingValueForSource not skipped',
+    () => skipper.initializeSkippingValueForSource(notSkipped),
   );
 
-  api.bench('initializeSkippingValueForSource with skipped', () =>
-    skipper.initializeSkippingValueForSource(isSkipped),
+  api.bench(
+    'initializeSkippingValueForSource with skipped',
+    () => skipper.initializeSkippingValueForSource(isSkipped),
   );
 }

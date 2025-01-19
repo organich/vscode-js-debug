@@ -2,12 +2,13 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { inject, injectable, multiInject } from 'inversify';
 import { homedir } from 'os';
 import { basename, join } from 'path';
 import * as vscode from 'vscode';
-import * as nls from 'vscode-nls';
-import { ProfilerFactory } from '../../adapter/profiling';
+import { getDefaultProfileName, ProfilerFactory } from '../../adapter/profiling';
+import { iteratorFirst } from '../../common/arrayUtils';
 import { Commands, ContextKey, setContextKey } from '../../common/contributionUtils';
 import { DisposableList, IDisposable } from '../../common/disposable';
 import { moveFile } from '../../common/fsUtils';
@@ -18,8 +19,6 @@ import { DebugSessionTracker } from '../debugSessionTracker';
 import { ManualTerminationCondition } from './manualTerminationCondition';
 import { ITerminationCondition, ITerminationConditionFactory } from './terminationCondition';
 import { UiProfileSession } from './uiProfileSession';
-
-const localize = nls.loadMessageBundle();
 
 const isProfileCandidate = (session: vscode.DebugSession) =>
   '__pendingTargetId' in session.configuration;
@@ -76,15 +75,15 @@ export class UiProfileManager implements IDisposable {
   private statusBarItem?: vscode.StatusBarItem;
   private lastChosenType: string | undefined;
   private lastChosenTermination: string | undefined;
-  private readonly activeSessions = new Map<string /* debug session id */, UiProfileSession>();
+  private readonly activeSessions = new Map<string, /* debug session id */ UiProfileSession>();
   private readonly disposables = new DisposableList();
 
   constructor(
     @inject(DebugSessionTracker) private readonly tracker: DebugSessionTracker,
     @inject(FS) private readonly fs: FsPromises,
     @inject(SessionSubStates) private readonly sessionStates: SessionSubStates,
-    @multiInject(ITerminationConditionFactory)
-    private readonly terminationConditions: ReadonlyArray<ITerminationConditionFactory>,
+    @multiInject(ITerminationConditionFactory) private readonly terminationConditions:
+      ReadonlyArray<ITerminationConditionFactory>,
   ) {
     this.disposables.push(
       vscode.debug.onDidReceiveDebugSessionCustomEvent(event => {
@@ -166,7 +165,9 @@ export class UiProfileManager implements IDisposable {
     if (sessionId) {
       uiSession = this.activeSessions.get(sessionId);
     } else {
-      const session = await this.pickSession([...this.activeSessions.values()].map(s => s.session));
+      const session = await this.pickSession(
+        [...this.activeSessions.values()].map(s => s.session),
+      );
       uiSession = session && this.activeSessions.get(session.id);
     }
 
@@ -195,7 +196,7 @@ export class UiProfileManager implements IDisposable {
    */
   private registerSession(uiSession: UiProfileSession, onCompleteCommand?: string) {
     this.activeSessions.set(uiSession.session.id, uiSession);
-    this.sessionStates.add(uiSession.session.id, localize('profile.sessionState', 'Profiling'));
+    this.sessionStates.add(uiSession.session.id, l10n.t('Profiling'));
     uiSession.onStatusChange(() => this.updateStatusBar());
     uiSession.onStop(file => {
       if (file) {
@@ -229,25 +230,11 @@ export class UiProfileManager implements IDisposable {
       ]);
     }
 
-    const directory =
-      session.workspaceFolder?.uri.fsPath ??
-      vscode.workspace.workspaceFolders?.[0].uri.fsPath ??
-      homedir();
+    const directory = session.workspaceFolder?.uri.fsPath
+      ?? vscode.workspace.workspaceFolders?.[0].uri.fsPath
+      ?? homedir();
 
-    const now = new Date();
-    const filename =
-      [
-        'vscode-profile',
-        now.getFullYear(),
-        now.getMonth() + 1,
-        now.getDate(),
-        now.getHours(),
-        now.getMinutes(),
-        now.getSeconds(),
-      ]
-        .map(n => String(n).padStart(2, '0'))
-        .join('-') + uiSession.impl.extension;
-
+    const filename = getDefaultProfileName() + uiSession.impl.extension;
     // todo: open as untitled, see: https://github.com/microsoft/vscode/issues/93441
     const fileUri = vscode.Uri.file(join(directory, filename));
     await moveFile(this.fs, sourceFile, fileUri.fsPath);
@@ -275,19 +262,15 @@ export class UiProfileManager implements IDisposable {
 
     setContextKey(vscode.commands, ContextKey.IsProfiling, true);
 
-    if (this.activeSessions.size === 1) {
-      const session: UiProfileSession = this.activeSessions.values().next().value;
+    const session = iteratorFirst(this.activeSessions.values());
+    if (session && this.activeSessions.size === 1) {
       this.statusBarItem.text = session.status
-        ? localize(
-            'profile.status.single',
-            '$(loading~spin) Click to Stop Profiling ({0})',
-            session.status,
-          )
-        : localize('profile.status.default', '$(loading~spin) Click to Stop Profiling');
+        ? l10n.t('{0} Click to Stop Profiling ({1})', '$(loading~spin)', session.status)
+        : l10n.t('{0} Click to Stop Profiling', '$(loading~spin)');
     } else {
-      this.statusBarItem.text = localize(
-        'profile.status.multiSession',
-        '$(loading~spin) Click to Stop Profiling ({0} sessions)',
+      this.statusBarItem.text = l10n.t(
+        '{0} Click to Stop Profiling ({1} sessions)',
+        '$(loading~spin)',
         this.activeSessions.size,
       );
     }
@@ -300,11 +283,10 @@ export class UiProfileManager implements IDisposable {
    * if they want to stop and start profiling it again.
    */
   private async alreadyRunningSession(existing: UiProfileSession) {
-    const yes = localize('yes', 'Yes');
-    const no = localize('no', 'No');
+    const yes = l10n.t('Yes');
+    const no = l10n.t('No');
     const stopExisting = await vscode.window.showErrorMessage(
-      localize(
-        'profile.alreadyRunning',
+      l10n.t(
         'A profiling session is already running, would you like to stop it and start a new session?',
       ),
       yes,
@@ -347,7 +329,7 @@ export class UiProfileManager implements IDisposable {
     }
 
     const chosen = await this.pickWithLastDefault(
-      localize('profile.type.title', 'Type of profile:'),
+      l10n.t('Type of profile'),
       ProfilerFactory.ctors.filter(ctor => ctor.canApplyTo(params)),
       this.lastChosenType,
     );
@@ -373,7 +355,7 @@ export class UiProfileManager implements IDisposable {
     }
 
     const chosen = await this.pickWithLastDefault(
-      localize('profile.termination.title', 'How long to run the profile:'),
+      l10n.t('How long to run the profile'),
       this.terminationConditions,
       this.lastChosenTermination,
     );

@@ -2,11 +2,11 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { inject, injectable } from 'inversify';
 import { tmpdir } from 'os';
 import { basename, join } from 'path';
 import * as vscode from 'vscode';
-import * as nls from 'vscode-nls';
 import { DebugType } from '../../common/contributionUtils';
 import { isPortOpen } from '../../common/findOpenPort';
 import { existsWithoutDeref } from '../../common/fsUtils';
@@ -24,8 +24,6 @@ import { BaseConfigurationProvider } from './baseConfigurationProvider';
 import { BaseConfigurationResolver } from './baseConfigurationResolver';
 import { NodeConfigurationResolver } from './nodeDebugConfigurationResolver';
 import { TerminalDebugConfigurationResolver } from './terminalDebugConfigurationResolver';
-
-const localize = nls.loadMessageBundle();
 
 const isLaunch = (
   value: ResolvingConfiguration<unknown>,
@@ -45,10 +43,9 @@ export abstract class ChromiumDebugConfigurationResolver<T extends AnyChromiumCo
 {
   constructor(
     @inject(ExtensionContext) context: vscode.ExtensionContext,
-    @inject(NodeConfigurationResolver)
-    private readonly nodeProvider: NodeConfigurationResolver,
-    @inject(TerminalDebugConfigurationResolver)
-    private readonly terminalProvider: TerminalDebugConfigurationResolver,
+    @inject(NodeConfigurationResolver) private readonly nodeProvider: NodeConfigurationResolver,
+    @inject(TerminalDebugConfigurationResolver) private readonly terminalProvider:
+      TerminalDebugConfigurationResolver,
     @inject(ExtensionLocation) private readonly location: ExtensionLocation,
     @inject(FS) private readonly fs: FsPromises,
   ) {
@@ -118,6 +115,9 @@ export abstract class ChromiumDebugConfigurationResolver<T extends AnyChromiumCo
     }
 
     let config = debugConfiguration as T;
+    if ('port' in config && typeof config.port === 'string') {
+      config.port = Number(config.port);
+    }
 
     if (config.request === 'launch') {
       const resolvedDataDir = await this.ensureNoLockfile(config);
@@ -148,13 +148,12 @@ export abstract class ChromiumDebugConfigurationResolver<T extends AnyChromiumCo
       return config;
     }
 
-    const userDataDir =
-      typeof cast.userDataDir === 'string'
-        ? cast.userDataDir
-        : join(
-            this.extensionContext.storagePath ?? tmpdir(),
-            cast.runtimeArgs?.includes('--headless') ? '.headless-profile' : '.profile',
-          );
+    const userDataDir = typeof cast.userDataDir === 'string'
+      ? cast.userDataDir
+      : join(
+        this.extensionContext.storagePath ?? tmpdir(),
+        cast.runtimeArgs?.includes('--headless') ? '.headless-profile' : '.profile',
+      );
 
     // Warn if there's an existing instance, so we probably can't launch it in debug mode:
     const platformLock = join(
@@ -167,14 +166,13 @@ export abstract class ChromiumDebugConfigurationResolver<T extends AnyChromiumCo
     ]);
 
     if (lockfileExists) {
-      const debugAnyway = localize('existingBrowser.debugAnyway', 'Debug Anyway');
+      const debugAnyway = l10n.t('Debug Anyway');
       const result = await vscode.window.showErrorMessage(
-        localize(
-          'existingBrowser.alert',
+        l10n.t(
           'It looks like a browser is already running from {0}. Please close it before trying to debug, otherwise VS Code may not be able to connect to it.',
           cast.userDataDir === true
-            ? localize('existingBrowser.location.default', 'an old debug session')
-            : localize('existingBrowser.location.userDataDir', 'the configured userDataDir'),
+            ? l10n.t('an old debug session')
+            : l10n.t('the configured userDataDir'),
         ),
         { modal: true },
         debugAnyway,
@@ -229,7 +227,7 @@ export abstract class ChromiumDebugConfigurationProvider<
     return {
       type: this.getType(),
       request: 'launch',
-      name: localize('chrome.launch.name', 'Launch Chrome against localhost'),
+      name: l10n.t('Launch Chrome against localhost'),
       url: 'http://localhost:8080',
       webRoot: '${workspaceFolder}',
     } as ResolvingConfiguration<T>;

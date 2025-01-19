@@ -2,10 +2,10 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { inject, injectable, optional } from 'inversify';
 import type * as vscodeType from 'vscode';
 import { CancellationToken } from 'vscode';
-import * as nls from 'vscode-nls';
 import CdpConnection from '../../cdp/connection';
 import { NeverCancelled } from '../../common/cancellation';
 import { DebugType } from '../../common/contributionUtils';
@@ -28,14 +28,11 @@ import { BrowserTargetManager } from './browserTargetManager';
 import { BrowserTargetType } from './browserTargets';
 import * as launcher from './launcher';
 
-const localize = nls.loadMessageBundle();
-
 @injectable()
 export class BrowserAttacher<
   T extends AnyChromiumAttachConfiguration = AnyChromiumAttachConfiguration,
-> implements ILauncher
-{
-  private _attemptTimer: NodeJS.Timer | undefined;
+> implements ILauncher {
+  private _attemptTimer: NodeJS.Timeout | undefined;
   private _connection: CdpConnection | undefined;
   private _targetManager: BrowserTargetManager | undefined;
   private _disposables: IDisposable[] = [];
@@ -66,10 +63,10 @@ export class BrowserAttacher<
    */
   protected resolveParams(params: AnyLaunchConfiguration): params is T {
     return (
-      params.request === 'attach' &&
-      (params.type === DebugType.Chrome ||
-        (params.type === DebugType.Edge && typeof params.useWebView !== 'object')) &&
-      params.browserAttachLocation === 'workspace'
+      params.request === 'attach'
+      && (params.type === DebugType.Chrome
+        || (params.type === DebugType.Edge && typeof params.useWebView !== 'object'))
+      && params.browserAttachLocation === 'workspace'
     );
   }
 
@@ -163,6 +160,7 @@ export class BrowserAttacher<
       if (!targetManager.targetList().length) {
         // graceful exit
         this._onTerminatedEmitter.fire({ killed: true, code: 0 });
+        this._connection?.close();
       }
     });
 
@@ -198,7 +196,7 @@ export class BrowserAttacher<
       return target => target.targetId === targets[0].targetId;
     }
 
-    const placeHolder = localize('chrome.targets.placeholder', 'Select a tab');
+    const placeHolder = l10n.t('Select a tab');
     const selected = await this.vscode.window.showQuickPick(
       targets.map(target => ({
         label: target.title,
@@ -229,8 +227,7 @@ export class BrowserAttacher<
         if (cancellationToken.isCancellationRequested) {
           throw new ProtocolError(
             browserAttachFailed(
-              localize(
-                'attach.cannotConnect',
+              l10n.t(
                 'Cannot connect to the target at {0}: {1}',
                 `${params.address}:${params.port}`,
                 e.message,
@@ -245,8 +242,7 @@ export class BrowserAttacher<
 
     throw new ProtocolError(
       browserAttachFailed(
-        localize(
-          'attach.cannotConnect',
+        l10n.t(
           'Cannot connect to the target at {0}: {1}',
           `${params.address}:${params.port}`,
           'Cancelled',
@@ -276,10 +272,6 @@ export class BrowserAttacher<
   async terminate(): Promise<void> {
     this._lastLaunchParams = undefined;
     this._connection?.close();
-  }
-
-  public disconnect(): Promise<void> {
-    return this.terminate();
   }
 
   async restart(): Promise<void> {

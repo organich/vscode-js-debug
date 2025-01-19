@@ -2,19 +2,26 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import dataUriToBuffer from 'data-uri-to-buffer';
+import { dataUriToBuffer } from 'data-uri-to-buffer';
+import { LookupAddress, promises as dns } from 'dns';
 import got, { Headers, OptionsOfTextResponseBody, RequestError } from 'got';
 import { inject, injectable, optional } from 'inversify';
 import { CancellationToken } from 'vscode';
-import { HttpStatusError, IResourceProvider, Response } from '.';
 import { NeverCancelled } from '../../common/cancellation';
 import { DisposableList } from '../../common/disposable';
 import { fileUrlToAbsolutePath, isAbsolute, isLoopback } from '../../common/urlUtils';
 import { FS, FsPromises } from '../../ioc-extras';
+import { HttpStatusError, IResourceProvider, Response } from '.';
 import { IRequestOptionsProvider } from './requestOptionsProvider';
 
 @injectable()
 export class BasicResourceProvider implements IResourceProvider {
+  /**
+   * Map of ports to fallback hosts that ended up working. Used to optimistically
+   * fallback (see #1694)
+   */
+  private autoLocalhostPortFallbacks: Record<number, string> = {};
+
   constructor(
     @inject(FS) private readonly fs: FsPromises,
     @optional() @inject(IRequestOptionsProvider) private readonly options?: IRequestOptionsProvider,
@@ -30,7 +37,7 @@ export class BasicResourceProvider implements IResourceProvider {
   ): Promise<Response<string>> {
     try {
       const r = dataUriToBuffer(url);
-      return { ok: true, url, body: r.toString('utf-8'), statusCode: 200 };
+      return { ok: true, url, body: new TextDecoder().decode(r.buffer), statusCode: 200 };
     } catch {
       // assume it's a remote url
     }
@@ -81,20 +88,44 @@ export class BasicResourceProvider implements IResourceProvider {
     const parsed = new URL(url);
 
     const isSecure = parsed.protocol !== 'http:';
+    const port = Number(parsed.port) ?? (isSecure ? 443 : 80);
     const options: OptionsOfTextResponseBody = { headers, followRedirect: true };
     if (isSecure && (await isLoopback(url))) {
-      options.rejectUnauthorized = false;
+      options.rejectUnauthorized = false; // CodeQL [SM03616] Intentional for local development.
     }
 
     this.options?.provideOptions(options, url);
 
-    const response = await this.requestHttp(url, options, cancellationToken);
+    const isLocalhost = parsed.hostname === 'localhost';
+    const fallback = isLocalhost && this.autoLocalhostPortFallbacks[port];
+    if (fallback) {
+      const response = await this.requestHttp(parsed.toString(), options, cancellationToken);
+      if (response.statusCode !== 503) {
+        return response;
+      }
 
-    // Try 127.0.0.1 if localhost fails, see https://github.com/microsoft/vscode/issues/140536#issuecomment-1011281962
-    // The statusCode will be 503 on ECONNREFUSED
-    if (response.statusCode === 503 && parsed.hostname === 'localhost') {
-      parsed.hostname = '127.0.0.1';
-      return this.requestHttp(parsed.toString(), options, cancellationToken);
+      delete this.autoLocalhostPortFallbacks[port];
+      return this.requestHttp(url, options, cancellationToken);
+    }
+
+    let response = await this.requestHttp(url, options, cancellationToken);
+
+    // Try the other net family if localhost fails,
+    // see https://github.com/microsoft/vscode/issues/140536#issuecomment-1011281962
+    // and later https://github.com/microsoft/vscode/issues/167353
+    if (response.statusCode === 503 && isLocalhost) {
+      let resolved: LookupAddress;
+      try {
+        resolved = await dns.lookup(parsed.hostname);
+      } catch {
+        return response;
+      }
+
+      parsed.hostname = resolved.family === 6 ? '127.0.0.1' : '[::1]';
+      response = await this.requestHttp(parsed.toString(), options, cancellationToken);
+      if (response.statusCode !== 503) {
+        this.autoLocalhostPortFallbacks[port] = parsed.hostname;
+      }
     }
 
     return response;

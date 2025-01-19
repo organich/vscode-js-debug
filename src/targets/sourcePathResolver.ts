@@ -10,9 +10,11 @@ import {
   fixDriveLetter,
   fixDriveLetterAndSlashes,
   forceForwardSlashes,
+  isWindowsPath,
   properJoin,
   properRelative,
   properResolve,
+  properSplit,
 } from '../common/pathUtils';
 import { ISourceMapMetadata } from '../common/sourceMaps/sourceMap';
 import { ISourcePathResolver, IUrlResolution } from '../common/sourcePathResolver';
@@ -26,6 +28,7 @@ import {
 import { SourceMapOverrides } from './sourceMapOverrides';
 
 export interface ISourcePathResolverOptions {
+  workspaceFolder: string;
   resolveSourceMapLocations: ReadonlyArray<string> | null;
   sourceMapOverrides: { [key: string]: string };
   localRoot: string | null;
@@ -47,15 +50,35 @@ export abstract class SourcePathResolverBase<T extends ISourcePathResolverOption
    * of the path, to make `${workspaceFolder}/../foo` and the like work, since
    * micromatch doesn't have native awareness of them.
    */
-  private readonly resolveLocations = this.options.resolveSourceMapLocations?.map(location => {
-    location = location.replace(/\.[a-z0-9]+$/, '.*');
+  private readonly resolvePatterns = this.options.resolveSourceMapLocations?.map(location => {
     const prefix = location.startsWith('!') ? '!' : '';
-    const remaining = location.slice(prefix.length);
-    if (isAbsolute(remaining)) {
-      return prefix + properResolve(remaining);
+
+    // replace extensions with anything, to allow both .js and .map
+    let suffix = location.slice(prefix.length).replace(/(?<!\.)\.[^./\\]+$/, '.*');
+    if (!isAbsolute(suffix)) {
+      return forceForwardSlashes(location);
     }
 
-    return location;
+    suffix = forceForwardSlashes(properResolve(suffix));
+
+    // replace special minimatch characters that appear in the local root (vscode#166400)
+    const wfParts = properSplit(this.options.workspaceFolder);
+    const suffixParts = properSplit(suffix);
+    let sharedPrefixLen = 0;
+    for (
+      let i = 0;
+      i < wfParts.length
+      && i < suffixParts.length
+      && suffixParts[i].toLowerCase() === wfParts[i].toLowerCase();
+      i++
+    ) {
+      sharedPrefixLen += wfParts[i].length + 1;
+    }
+
+    suffix = suffix.slice(0, sharedPrefixLen).replace(/[\[\]\(\)\{\}\!\*]/g, '\\$&') // CodeQL [SM02383] backslashes are not present in this string
+      + suffix.slice(sharedPrefixLen);
+
+    return prefix + suffix;
   });
 
   constructor(protected readonly options: T, protected readonly logger: ILogger) {}
@@ -83,19 +106,19 @@ export abstract class SourcePathResolverBase<T extends ISourcePathResolverOption
       return false;
     }
 
-    if (!this.resolveLocations || this.resolveLocations.length === 0) {
+    if (!this.resolvePatterns || this.resolvePatterns.length === 0) {
       return true;
     }
 
     const sourcePath =
       // If the source map refers to an absolute path, that's what we're after
-      fileUrlToAbsolutePath(sourceMapUrl) ||
+      fileUrlToAbsolutePath(sourceMapUrl)
       // If it's a data URI, use the compiled path as a stand-in. It should
       // be quite rare that ignored files (i.e. node_modules) reference
       // source modules and vise versa.
-      (isDataUri(sourceMapUrl) && compiledPath) ||
+      || (isDataUri(sourceMapUrl) && compiledPath)
       // Fall back to the raw URL if those fail.
-      sourceMapUrl;
+      || sourceMapUrl;
 
     // Where the compiled path is webpack-internal, just resolve it. We have
     // no way to know where it's coming from, but this is necessary sometimes.
@@ -106,23 +129,14 @@ export abstract class SourcePathResolverBase<T extends ISourcePathResolverOption
 
     // Be case insensitive for things that might be remote uris--we have no way
     // to know whether the server is case sensitive or not.
-    const caseSensitive = /^[a-z]+:/i.test(sourceMapUrl) ? false : getCaseSensitivePaths();
-    const processMatchInput = (value: string) => {
-      value = forceForwardSlashes(value);
-      // built-in 'nocase' match option applies only to operand; we need to normalize both
-      return caseSensitive ? value : value.toLowerCase();
-    };
-
+    const caseSensitive = isWindowsPath(sourceMapUrl) ? false : getCaseSensitivePaths();
     const rebased = this.rebaseRemoteToLocal(sourcePath);
-    const testPatterns = rebased !== sourcePath ? [sourcePath, rebased] : [sourcePath];
+    const testLocations = rebased !== sourcePath ? [sourcePath, rebased] : [sourcePath];
 
-    const l = match(
-      testPatterns.map(processMatchInput),
-      this.resolveLocations.map(processMatchInput),
-      {
-        dot: true,
-      },
-    );
+    const l = match(testLocations.map(forceForwardSlashes), this.resolvePatterns, {
+      dot: true,
+      nocase: !caseSensitive,
+    });
 
     return l.length > 0;
   }
@@ -195,7 +209,8 @@ export abstract class SourcePathResolverBase<T extends ISourcePathResolverOption
 
   private canMapPath(candidate: string) {
     return (
-      path.posix.isAbsolute(candidate) || path.win32.isAbsolute(candidate) || isFileUrl(candidate)
+      path.posix.isAbsolute(candidate) || path.win32.isAbsolute(candidate)
+      || isFileUrl(candidate)
     );
   }
 }

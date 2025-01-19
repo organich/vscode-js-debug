@@ -13,9 +13,12 @@ import { Container, interfaces } from 'inversify';
 import 'reflect-metadata';
 import * as vscode from 'vscode';
 import {
-  BreakpointPredictorDelegate,
+  BreakpointPredictorCachedState,
+  BreakpointSearch,
   BreakpointsPredictor,
+  GlobalBreakpointSearch,
   IBreakpointsPredictor,
+  TargetedBreakpointSearch,
 } from './adapter/breakpointPredictor';
 import { BreakpointManager } from './adapter/breakpoints';
 import {
@@ -29,6 +32,14 @@ import { IConsole } from './adapter/console';
 import { Console } from './adapter/console/console';
 import { Diagnostics } from './adapter/diagnosics';
 import { DiagnosticToolSuggester } from './adapter/diagnosticToolSuggester';
+import { IDwarfModuleProvider } from './adapter/dwarf/dwarfModuleProvider';
+import { DwarfModuleProvider } from './adapter/dwarf/dwarfModuleProviderImpl';
+import {
+  IWasmSymbolProvider,
+  IWasmWorkerFactory,
+  WasmSymbolProvider,
+  WasmWorkerFactory,
+} from './adapter/dwarf/wasmSymbolProvider';
 import { Evaluator, IEvaluator } from './adapter/evaluator';
 import { ExceptionPauseService, IExceptionPauseService } from './adapter/exceptionPauseService';
 import { IPerformanceProvider, PerformanceProviderFactory } from './adapter/performance';
@@ -39,13 +50,11 @@ import { BasicCpuProfiler } from './adapter/profiling/basicCpuProfiler';
 import { BasicHeapProfiler } from './adapter/profiling/basicHeapProfiler';
 import { HeapDumpProfiler } from './adapter/profiling/heapDumpProfiler';
 import { IResourceProvider } from './adapter/resourceProvider';
-import { IRequestOptionsProvider } from './adapter/resourceProvider/requestOptionsProvider';
-import { ResourceProviderState } from './adapter/resourceProvider/resourceProviderState';
 import { StatefulResourceProvider } from './adapter/resourceProvider/statefulResourceProvider';
 import { ScriptSkipper } from './adapter/scriptSkipper/implementation';
 import { IScriptSkipper } from './adapter/scriptSkipper/scriptSkipper';
 import { SmartStepper } from './adapter/smartStepping';
-import { SourceContainer } from './adapter/sources';
+import { SourceContainer } from './adapter/sourceContainer';
 import { IVueFileMapper, VueFileMapper } from './adapter/vueFileMapper';
 import Cdp from './cdp/api';
 import { ICdpApi } from './cdp/connection';
@@ -56,10 +65,15 @@ import { IFsUtils, LocalAndRemoteFsUtils, LocalFsUtils } from './common/fsUtils'
 import { ILogger } from './common/logging';
 import { Logger } from './common/logging/logger';
 import { createMutableLaunchConfig, MutableLaunchConfig } from './common/mutableLaunchConfig';
-import { CodeSearchStrategy } from './common/sourceMaps/codeSearchStrategy';
 import { IRenameProvider, RenameProvider } from './common/sourceMaps/renameProvider';
-import { CachingSourceMapFactory, ISourceMapFactory } from './common/sourceMaps/sourceMapFactory';
+import {
+  CachingSourceMapFactory,
+  IRootSourceMapFactory,
+  ISourceMapFactory,
+  SourceMapFactory,
+} from './common/sourceMaps/sourceMapFactory';
 import { ISearchStrategy } from './common/sourceMaps/sourceMapRepository';
+import { TurboSearchStrategy } from './common/sourceMaps/turboSearchStrategy';
 import { ISourcePathResolver } from './common/sourcePathResolver';
 import { AnyLaunchConfiguration } from './configuration';
 import Dap from './dap/api';
@@ -76,7 +90,6 @@ import {
   SessionSubStates,
   StoragePath,
   trackDispose,
-  VSCodeApi,
 } from './ioc-extras';
 import { BrowserAttacher } from './targets/browser/browserAttacher';
 import { ChromeLauncher } from './targets/browser/chromeLauncher';
@@ -113,6 +126,8 @@ import { IExperimentationService } from './telemetry/experimentationService';
 import { NullExperimentationService } from './telemetry/nullExperimentationService';
 import { NullTelemetryReporter } from './telemetry/nullTelemetryReporter';
 import { ITelemetryReporter } from './telemetry/telemetryReporter';
+import { IShutdownParticipants, ShutdownParticipants } from './ui/shutdownParticipants';
+import { registerTopLevelSessionComponents, registerUiComponents } from './ui/ui-ioc';
 
 /**
  * Contains IOC container factories for the extension. We use Inverisfy, which
@@ -148,6 +163,7 @@ export const createTargetContainer = (
   container.bind(ITarget).toConstantValue(target);
   container.bind(ITargetOrigin).toConstantValue(target.targetOrigin());
   container.bind(IResourceProvider).to(StatefulResourceProvider).inSingletonScope();
+  container.bind(ISourceMapFactory).to(SourceMapFactory).inSingletonScope();
   container.bind(IBreakpointConditionFactory).to(BreakpointConditionFactory).inSingletonScope();
   container.bind(LogPointCompiler).toSelf().inSingletonScope();
 
@@ -161,13 +177,11 @@ export const createTargetContainer = (
     .toDynamicValue(ctx => ctx.container.get(PerformanceProviderFactory).create())
     .inSingletonScope();
 
-  container.bind(BreakpointPredictorDelegate).toSelf().inSingletonScope();
-
-  container
-    .bind(IBreakpointsPredictor)
-    .toDynamicValue(() => parent.get<BreakpointPredictorDelegate>(IBreakpointsPredictor).getChild())
-    .inSingletonScope()
-    .onActivation(trackDispose);
+  // nested children only run targeted search
+  if (target.parent()) {
+    container.bind(IBreakpointsPredictor).to(BreakpointsPredictor).inSingletonScope();
+    container.bind(BreakpointSearch).to(TargetedBreakpointSearch).inSingletonScope();
+  }
 
   container
     .bind(ITelemetryReporter)
@@ -184,7 +198,13 @@ export const createTargetContainer = (
   container.bind(IExceptionPauseService).to(ExceptionPauseService).inSingletonScope();
   container.bind(ICompletions).to(Completions).inSingletonScope();
   container.bind(IEvaluator).to(Evaluator).inSingletonScope();
-  container.bind(IConsole).to(Console).inSingletonScope(); // dispose is handled by the Thread
+  container.bind(IConsole).to(Console).inSingletonScope();
+  container.bind(IShutdownParticipants).to(ShutdownParticipants).inSingletonScope();
+  container
+    .bind(IWasmSymbolProvider)
+    .to(WasmSymbolProvider)
+    .inSingletonScope()
+    .onActivation(trackDispose);
 
   container.bind(BasicCpuProfiler).toSelf();
   container.bind(BasicHeapProfiler).toSelf();
@@ -216,7 +236,6 @@ export const createTopLevelSessionContainer = (parent: Container) => {
 
   // Core services:
   container.bind(ILogger).to(Logger).inSingletonScope().onActivation(trackDispose);
-  container.bind(ResourceProviderState).toSelf().inSingletonScope();
   container.bind(IResourceProvider).to(StatefulResourceProvider).inSingletonScope();
   container
     .bind(ITelemetryReporter)
@@ -227,10 +246,7 @@ export const createTopLevelSessionContainer = (parent: Container) => {
   container.bind(OutFiles).to(OutFiles).inSingletonScope();
   container.bind(VueComponentPaths).to(VueComponentPaths).inSingletonScope();
   container.bind(IVueFileMapper).to(VueFileMapper).inSingletonScope();
-  container
-    .bind(ISearchStrategy)
-    .toDynamicValue(ctx => CodeSearchStrategy.createOrFallback(ctx.container.get<ILogger>(ILogger)))
-    .inSingletonScope();
+  container.bind(ISearchStrategy).to(TurboSearchStrategy).inSingletonScope();
 
   container.bind(INodeBinaryProvider).to(InteractiveNodeBinaryProvider);
   container.bind(RemoteBrowserHelper).toSelf().inSingletonScope().onActivation(trackDispose);
@@ -245,32 +261,19 @@ export const createTopLevelSessionContainer = (parent: Container) => {
   container.bind(IProgramLauncher).to(TerminalProgramLauncher);
   container.bind(IPackageJsonProvider).to(PackageJsonProvider).inSingletonScope();
 
-  if (parent.get(IsVSCode)) {
-    // dynamic require to not break the debug server
-    container
-      .bind(ILauncher)
-      .to(require('./targets/node/terminalNodeLauncher').TerminalNodeLauncher)
-      .onActivation(trackDispose);
-
-    // request options:
-    container
-      .bind(IRequestOptionsProvider)
-      .to(require('./ui/settingRequestOptionsProvider').SettingRequestOptionsProvider)
-      .inSingletonScope();
-
-    container
-      .bind(IExperimentationService)
-      .to(require('./telemetry/vscodeExperimentationService').VSCodeExperimentationService)
-      .inSingletonScope();
-  }
+  registerTopLevelSessionComponents(container);
 
   container.bind(ILauncher).to(NodeAttacher).onActivation(trackDispose);
 
   container.bind(ChromeLauncher).toSelf().inSingletonScope().onActivation(trackDispose);
   container.bind(ILauncher).toService(ChromeLauncher);
   container.bind(ILauncher).to(EdgeLauncher).inSingletonScope().onActivation(trackDispose);
-  container.bind(ILauncher).to(RemoteBrowserLauncher).inSingletonScope().onActivation(trackDispose);
-  container.bind(ILauncher).to(RemoteBrowserAttacher).inSingletonScope().onActivation(trackDispose);
+  container.bind(ILauncher).to(RemoteBrowserLauncher).inSingletonScope().onActivation(
+    trackDispose,
+  );
+  container.bind(ILauncher).to(RemoteBrowserAttacher).inSingletonScope().onActivation(
+    trackDispose,
+  );
   container
     .bind(ILauncher)
     .to(UWPWebviewBrowserAttacher)
@@ -281,9 +284,18 @@ export const createTopLevelSessionContainer = (parent: Container) => {
   container
     .bind(ILauncher)
     .toDynamicValue(() =>
-      parent.get(DelegateLauncherFactory).createLauncher(container.get(ILogger)),
+      parent.get(DelegateLauncherFactory).createLauncher(container.get(ILogger))
     )
     .inSingletonScope();
+
+  if (!container.isBound(IDwarfModuleProvider)) {
+    container.bind(IDwarfModuleProvider).to(DwarfModuleProvider).inSingletonScope();
+  }
+  container
+    .bind(IWasmWorkerFactory)
+    .to(WasmWorkerFactory)
+    .inSingletonScope()
+    .onActivation(trackDispose);
 
   const browserFinderFactory = (ctor: BrowserFinderCtor) => (ctx: interfaces.Context) =>
     new ctor(ctx.container.get(ProcessEnv), ctx.container.get(FS), ctx.container.get(Execa));
@@ -333,13 +345,7 @@ export const createGlobalContainer = (options: {
     container.bind(ExtensionContext).toConstantValue(options.context);
   }
 
-  // Dependency that pull from the vscode global--aren't safe to require at
-  // a top level (e.g. in the debug server)
-  if (options.isVsCode) {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    container.bind(VSCodeApi).toConstantValue(require('vscode'));
-    require('./ui/ui-ioc').registerUiComponents(container);
-  }
+  registerUiComponents(container);
 
   return container;
 };
@@ -359,7 +365,7 @@ export const provideLaunchParams = (
     .toDynamicValue(ctx =>
       ctx.container
         .get<ISourcePathResolverFactory>(ISourcePathResolverFactory)
-        .create(params, ctx.container.get<ILogger>(ILogger)),
+        .create(params, ctx.container.get<ILogger>(ILogger))
     )
     .inSingletonScope();
 
@@ -369,21 +375,16 @@ export const provideLaunchParams = (
 
   // Source handling:
   container
-    .bind(ISourceMapFactory)
+    .bind(IRootSourceMapFactory)
     .to(CachingSourceMapFactory)
     .inSingletonScope()
     .onActivation(trackDispose);
   container.bind(IRenameProvider).to(RenameProvider).inSingletonScope();
   container.bind(DiagnosticToolSuggester).toSelf().inSingletonScope().onActivation(trackDispose);
+  container.bind(ISourceMapFactory).to(SourceMapFactory).inSingletonScope();
 
-  container.bind(BreakpointsPredictor).toSelf();
-  container
-    .bind(IBreakpointsPredictor)
-    .toDynamicValue(
-      ctx =>
-        new BreakpointPredictorDelegate(ctx.container.get(ISourceMapFactory), () =>
-          ctx.container.get(BreakpointsPredictor),
-        ),
-    )
-    .inSingletonScope();
+  // BP predictor:
+  container.bind(BreakpointPredictorCachedState).toSelf().inSingletonScope();
+  container.bind(IBreakpointsPredictor).to(BreakpointsPredictor).inSingletonScope();
+  container.bind(BreakpointSearch).to(GlobalBreakpointSearch).inSingletonScope();
 };

@@ -33,7 +33,7 @@ export default class Connection {
   private _pendingRequests = new Map<number, (result: string | object) => void>();
   private _requestHandlers = new Map<string, (params: object) => Promise<object>>();
   private _eventListeners = new Map<string, Set<(params: object) => void>>();
-  private _dap: Promise<Dap.Api>;
+  private _dap: Dap.Api;
   private disposables: IDisposable[] = [];
 
   private _initialized = getDeferred<Connection>();
@@ -52,15 +52,15 @@ export default class Connection {
     this.disposables.push(
       this.transport.messageReceived(event => this._onMessage(event.message, event.receivedTime)),
     );
-    this._dap = Promise.resolve(this._createApi());
+    this._dap = this._createApi();
   }
 
   public attachTelemetry(telemetryReporter: ITelemetryReporter) {
     this.telemetryReporter = telemetryReporter;
-    this._dap.then(dap => telemetryReporter.attachDap(dap));
+    telemetryReporter.attachDap(this._dap);
   }
 
-  public dap(): Promise<Dap.Api> {
+  public dap(): Dap.Api {
     return this._dap;
   }
 
@@ -76,8 +76,9 @@ export default class Connection {
               return () => this._requestHandlers.delete(requestName);
             };
           }
-          if (methodName === 'off')
+          if (methodName === 'off') {
             return (requestName: string) => this._requestHandlers.delete(requestName);
+          }
           return (params: object) => {
             if (isRequest(methodName)) {
               return this.enqueueRequest(methodName.slice(0, -requestSuffix.length), params);
@@ -139,18 +140,19 @@ export default class Connection {
     this.transport.close();
   }
 
-  _send(message: Message) {
+  _send(message: Message, onDidWrite?: () => void) {
     if (!this.closed) {
       message.seq = this._sequence++;
 
       const shouldLog = message.type !== 'event' || !logOmittedCalls.has(message.body);
-      this.transport.send(message, shouldLog);
+      this.transport.send(message, shouldLog, onDidWrite);
     } else {
       this.logger.warn(
         LogTag.DapSend,
         `Not sending message because the connection has ended`,
         message,
       );
+      onDidWrite?.();
     }
   }
 
@@ -178,15 +180,18 @@ export default class Connection {
               body: { error: result.error },
             });
           } else {
-            this._send({ ...response, body: result });
+            const msg = { ...response, body: result };
             if (response.command === 'initialize') {
+              this._send(msg);
               this._initialized.resolve(this);
             } else if (response.command === 'disconnect') {
               // close the DAP connection after we respond to disconnect so that
               // no more messages are allowed to go through.
-              process.nextTick(() => {
+              this._send({ ...response, body: result }, () => {
                 this.stop();
               });
+            } else {
+              this._send(msg);
             }
           }
         }
@@ -232,7 +237,9 @@ export default class Connection {
     }
     if (msg.type === 'response') {
       const cb = this._pendingRequests.get(msg.request_seq);
-      if (!this.logger.assert(cb, `Expected callback for request sequence ID ${msg.request_seq}`)) {
+      if (
+        !this.logger.assert(cb, `Expected callback for request sequence ID ${msg.request_seq}`)
+      ) {
         return;
       }
 

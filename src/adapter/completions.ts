@@ -4,13 +4,19 @@
 
 import { Node as AcornNode } from 'acorn';
 import { isDummy } from 'acorn-loose';
-import { traverse, VisitorOption } from 'estraverse';
 import { Identifier, MemberExpression, Node, Program } from 'estree';
 import { inject, injectable } from 'inversify';
 import Cdp from '../cdp/api';
 import { ICdpApi } from '../cdp/connection';
 import { IPosition } from '../common/positions';
-import { getEnd, getStart, getText, parseProgram } from '../common/sourceCodeManipulations';
+import {
+  getEnd,
+  getStart,
+  getText,
+  parseProgram,
+  traverse,
+  VisitorOption,
+} from '../common/sourceCodeManipulations';
 import { PositionToOffset } from '../common/stringUtils';
 import Dap from '../dap/api';
 import { IEvaluator, returnValueStr } from './evaluator';
@@ -82,10 +88,9 @@ const inferCompletionInfoForDeclaration = (node: Node) => {
       return { type: CompletionKind.Class, id: node.id };
     case 'MethodDefinition':
       return {
-        type:
-          node.key?.type === 'Identifier' && node.key.name === 'constructor'
-            ? CompletionKind.Constructor
-            : CompletionKind.Method,
+        type: node.key?.type === 'Identifier' && node.key.name === 'constructor'
+          ? CompletionKind.Constructor
+          : CompletionKind.Method,
         id: node.key,
       };
     case 'VariableDeclarator':
@@ -104,10 +109,10 @@ function maybeHasSideEffects(node: Node): boolean {
   traverse(node, {
     enter(node) {
       if (
-        node.type === 'CallExpression' ||
-        node.type === 'NewExpression' ||
-        (node.type === 'UnaryExpression' && node.operator === 'delete') ||
-        node.type === 'ClassBody'
+        node.type === 'CallExpression'
+        || node.type === 'NewExpression'
+        || (node.type === 'UnaryExpression' && node.operator === 'delete')
+        || node.type === 'ClassBody'
       ) {
         result = true;
         return VisitorOption.Break;
@@ -145,16 +150,26 @@ export class Completions {
     let candidate: () => Promise<ICompletionWithSort[]> = () => Promise.resolve([]);
 
     traverse(source, {
-      enter: node => {
+      enter: (node, parent) => {
         const asAcorn = node as AcornNode;
         if (asAcorn.start < offset && offset <= asAcorn.end) {
-          if (node.type === 'Identifier') {
+          if (
+            node.type === 'MemberExpression'
+            || (node.type === 'Identifier'
+              && parent?.type === 'MemberExpression'
+              && !parent.computed
+              && parent.object !== node)
+          ) {
+            const memberExpression = node.type === 'MemberExpression'
+              ? node
+              : (parent as MemberExpression);
+            candidate = memberExpression.computed
+              ? () => this.elementAccessCompleter(options, memberExpression, offset)
+              : () => this.propertyAccessCompleter(options, memberExpression, offset);
+          } else if (node.type === 'Identifier') {
             candidate = () => this.identifierCompleter(options, source, node, offset);
-          } else if (node.type === 'MemberExpression') {
-            candidate = node.computed
-              ? () => this.elementAccessCompleter(options, node, offset)
-              : () => this.propertyAccessCompleter(options, node, offset);
           }
+          parent = node;
         }
       },
     });
@@ -216,12 +231,15 @@ export class Completions {
     });
 
     const prefix = options.expression.slice(getStart(node), offset);
-    const completions = [...localIdentifiers, ...(await this.defaultCompletions(options, prefix))];
+    const completions = [
+      ...localIdentifiers,
+      ...(await this.defaultCompletions(options, prefix)),
+    ];
 
     if (
-      this.evaluator.hasReturnValue &&
-      options.executionContextId !== undefined &&
-      returnValueStr.startsWith(prefix)
+      this.evaluator.hasReturnValue
+      && options.executionContextId !== undefined
+      && returnValueStr.startsWith(prefix)
     ) {
       completions.push({
         sortText: `~${returnValueStr}`,
@@ -324,7 +342,7 @@ export class Completions {
         ...params,
         returnByValue: true,
         throwOnSideEffect: false,
-        expression: enumeratePropertiesTemplate(
+        expression: enumeratePropertiesTemplate.expr(
           `(${expression})`,
           JSON.stringify(prefix),
           JSON.stringify(isInGlobalScope),
@@ -382,8 +400,8 @@ export class Completions {
         const names = new Set(items.map(item => item.label));
         for (const completion of await options.stackFrame.completions()) {
           if (
-            names.has(completion.label) ||
-            !completion.label.toLowerCase().includes(lowerPrefix)
+            names.has(completion.label)
+            || !completion.label.toLowerCase().includes(lowerPrefix)
           ) {
             continue;
           }

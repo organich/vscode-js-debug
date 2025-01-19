@@ -2,9 +2,10 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import pkg from '../package.json';
-import { SourceMapTimeouts } from './adapter/sources';
+import { homedir } from 'os';
+import { SourceMapTimeouts } from './adapter/sourceContainer';
 import { DebugType } from './common/contributionUtils';
+import { nodeInternalsToken } from './common/node15Internal';
 import { assertNever, filterValues } from './common/objUtils';
 import Dap from './dap/api';
 import { AnyRestartOptions } from './targets/node/restartPolicy';
@@ -160,6 +161,13 @@ export interface IBaseConfiguration extends IMandatedConfiguration {
   cascadeTerminateToConfigurations: string[];
 
   /**
+   * Toggles whether the debugger will try to read DWARF debug symbols from
+   * WebAssembly, which can be resource intensive. Requires the
+   * `ms-vscode.wasm-dwarf-debugging` extension to function.
+   */
+  enableDWARF: boolean;
+
+  /**
    * The value of the ${workspaceFolder} variable
    */
   __workspaceFolder: string;
@@ -240,6 +248,18 @@ export interface IExtensionHostLaunchConfiguration extends IExtensionHostBaseCon
    * Chrome launch options used when attaching to the renderer process.
    */
   rendererDebugOptions: Partial<IChromeAttachConfiguration>;
+
+  /**
+   * Path to a test configuration file for the test CLI.
+   * @see https://code.visualstudio.com/api/working-with-extensions/testing-extension#quick-setup-the-test-cli
+   */
+  testConfiguration?: string;
+
+  /**
+   * A single configuration to run from the file. If not specified, the user
+   * may be asked to pick.
+   */
+  testConfigurationLabel?: string;
 
   /**
    * Port the extension host is listening on.
@@ -420,6 +440,11 @@ export interface INodeLaunchConfiguration extends INodeBaseConfiguration, IConfi
    *  - none: no termination will happen.
    */
   killBehavior: KillBehavior;
+
+  /**
+   * Whether to automatically add the `--experimental-network-inspection` flag.
+   */
+  experimentalNetworking: 'on' | 'off' | 'auto';
 }
 
 /**
@@ -519,6 +544,13 @@ export interface INodeAttachConfiguration extends INodeBaseConfiguration {
   websocketAddress?: string;
 
   /**
+   * Explicit Host header to use when connecting to the websocket of inspector.
+   * If not set, the host header will be set to 'localhost'.
+   * This is useful when the inspector is running behind a proxy that only accept particular Host header.
+   */
+  remoteHostHeader?: string;
+
+  /**
    * TCP/IP address of process to be debugged. Default is 'localhost'.
    */
   address: string;
@@ -586,7 +618,7 @@ export interface IChromiumLaunchConfiguration extends IChromiumBaseConfiguration
   runtimeArgs: ReadonlyArray<string> | null;
 
   /**
-   * Either 'canary', 'stable', 'custom' or path to the browser executable.
+   * Either 'canary', 'stable', 'beta', 'dev', 'custom' or path to the browser executable.
    * Custom means a custom wrapper, custom build or CHROME_PATH
    * environment variable.
    */
@@ -747,14 +779,17 @@ export type AnyTerminalConfiguration =
  */
 export type ResolvingConfiguration<T> = IMandatedConfiguration & Partial<T>;
 
-export type ResolvingExtensionHostConfiguration =
-  ResolvingConfiguration<IExtensionHostLaunchConfiguration>;
+export type ResolvingExtensionHostConfiguration = ResolvingConfiguration<
+  IExtensionHostLaunchConfiguration
+>;
 export type ResolvingNodeAttachConfiguration = ResolvingConfiguration<INodeAttachConfiguration>;
 export type ResolvingNodeLaunchConfiguration = ResolvingConfiguration<INodeLaunchConfiguration>;
-export type ResolvingTerminalDelegateConfiguration =
-  ResolvingConfiguration<ITerminalDelegateConfiguration>;
-export type ResolvingTerminalLaunchConfiguration =
-  ResolvingConfiguration<ITerminalLaunchConfiguration>;
+export type ResolvingTerminalDelegateConfiguration = ResolvingConfiguration<
+  ITerminalDelegateConfiguration
+>;
+export type ResolvingTerminalLaunchConfiguration = ResolvingConfiguration<
+  ITerminalLaunchConfiguration
+>;
 export type ResolvingTerminalConfiguration =
   | ResolvingTerminalDelegateConfiguration
   | ResolvingTerminalLaunchConfiguration;
@@ -778,14 +813,10 @@ export const AnyLaunchConfiguration = Symbol('AnyLaunchConfiguration');
  */
 export type ResolvedConfiguration<T> = T extends ResolvingNodeAttachConfiguration
   ? INodeAttachConfiguration
-  : T extends ResolvingExtensionHostConfiguration
-  ? IExtensionHostLaunchConfiguration
-  : T extends ResolvingNodeLaunchConfiguration
-  ? INodeLaunchConfiguration
-  : T extends ResolvingChromeConfiguration
-  ? AnyChromeConfiguration
-  : T extends ResolvingTerminalConfiguration
-  ? ITerminalLaunchConfiguration
+  : T extends ResolvingExtensionHostConfiguration ? IExtensionHostLaunchConfiguration
+  : T extends ResolvingNodeLaunchConfiguration ? INodeLaunchConfiguration
+  : T extends ResolvingChromeConfiguration ? AnyChromeConfiguration
+  : T extends ResolvingTerminalConfiguration ? ITerminalLaunchConfiguration
   : never;
 
 export const baseDefaults: IBaseConfiguration = {
@@ -804,10 +835,11 @@ export const baseDefaults: IBaseConfiguration = {
   pauseForSourceMap: true,
   resolveSourceMapLocations: null,
   rootPath: '${workspaceFolder}',
-  outFiles: ['${workspaceFolder}/**/*.js', '!**/node_modules/**'],
+  outFiles: ['${workspaceFolder}/**/*.(m|c|)js', '!**/node_modules/**'],
   sourceMapPathOverrides: defaultSourceMapPathOverrides('${workspaceFolder}'),
   enableContentValidation: true,
   cascadeTerminateToConfigurations: [],
+  enableDWARF: true,
   // Should always be determined upstream;
   __workspaceFolder: '',
   __remoteFilePrefix: undefined,
@@ -828,7 +860,7 @@ const nodeBaseDefaults: INodeBaseConfiguration = {
   resolveSourceMapLocations: ['**', '!**/node_modules/**'],
   autoAttachChildProcesses: true,
   runtimeSourcemapPausePatterns: [],
-  skipFiles: ['<node_internals>/**'],
+  skipFiles: [`${nodeInternalsToken}/**`],
 };
 
 export const terminalBaseDefaults: ITerminalLaunchConfiguration = {
@@ -879,6 +911,7 @@ export const nodeLaunchConfigDefaults: INodeLaunchConfiguration = {
   runtimeArgs: [],
   profileStartup: false,
   attachSimplePort: null,
+  experimentalNetworking: 'auto',
   killBehavior: KillBehavior.Forceful,
 };
 
@@ -951,20 +984,31 @@ export function defaultSourceMapPathOverrides(webRoot: string): { [key: string]:
     'webpack://?:*/*': `${webRoot}/*`,
     'webpack:///([a-z]):/(.+)': '$1:/$2',
     'meteor://💻app/*': `${webRoot}/*`,
+    'turbopack://[project]/*': '${workspaceFolder}/*',
   };
 }
 
-export function applyNodeDefaults({ ...config }: ResolvingNodeConfiguration): AnyNodeConfiguration {
+export const applyNodeishDefaults = (
+  config:
+    | ResolvingNodeConfiguration
+    | ResolvingTerminalConfiguration
+    | ResolvingExtensionHostConfiguration,
+) => {
   if (!config.sourceMapPathOverrides && config.cwd) {
     config.sourceMapPathOverrides = defaultSourceMapPathOverrides(config.cwd);
   }
 
   // Resolve source map locations from the outFiles by default:
   // https://github.com/microsoft/vscode-js-debug/issues/704
-  if (config.resolveSourceMapLocations === undefined && !config.remoteRoot) {
+  if (config.resolveSourceMapLocations === undefined) {
     config.resolveSourceMapLocations = config.outFiles;
   }
+};
 
+export function applyNodeDefaults(
+  { ...config }: ResolvingNodeConfiguration,
+): AnyNodeConfiguration {
+  applyNodeishDefaults(config);
   if (config.request === 'attach') {
     return { ...nodeAttachConfigDefaults, ...config };
   } else {
@@ -1001,10 +1045,7 @@ export function applyExtensionHostDefaults(
 export function applyTerminalDefaults(
   config: ResolvingTerminalConfiguration,
 ): AnyTerminalConfiguration {
-  if (!config.sourceMapPathOverrides && config.cwd) {
-    config.sourceMapPathOverrides = defaultSourceMapPathOverrides(config.cwd);
-  }
-
+  applyNodeishDefaults(config);
   return config.request === 'launch'
     ? { ...terminalBaseDefaults, ...config }
     : { ...delegateDefaults, ...config };
@@ -1066,12 +1107,13 @@ export function removeOptionalWorkspaceFolderUsages<T extends AnyLaunchConfigura
   }
 
   if ('resolveSourceMapLocations' in cast) {
-    cast.resolveSourceMapLocations =
-      cast.resolveSourceMapLocations?.filter(o => !o.includes(token)) ?? null;
+    cast.resolveSourceMapLocations = cast.resolveSourceMapLocations?.filter(o => !o.includes(token))
+      ?? null;
   }
 
   if ('cwd' in cast && cast.cwd?.includes(token)) {
-    cast.cwd = undefined;
+    // cwd is required (only) for node launch types
+    cast.cwd = cast.request === 'launch' && cast.type === DebugType.Node ? homedir() : undefined;
   }
 
   if ('webRoot' in cast && cast.webRoot?.includes(token)) {
@@ -1137,10 +1179,24 @@ export const breakpointLanguages: ReadonlyArray<string> = [
   'javascriptreact',
   'fsharp',
   'html',
+  'wat',
+  // Common wasm languages:
+  'c',
+  'cpp',
+  'rust',
+  'zig',
 ];
 
-export const packageName: string = pkg.name;
-export const packageVersion: string = pkg.version;
-export const packagePublisher: string = pkg.publisher;
+declare const EXTENSION_NAME: string;
+declare const EXTENSION_VERSION: string;
+declare const EXTENSION_PUBLISHER: string;
+
+export const packageName = typeof EXTENSION_NAME !== 'undefined' ? EXTENSION_NAME : 'js-debug';
+export const packageVersion = typeof EXTENSION_VERSION !== 'undefined'
+  ? EXTENSION_VERSION
+  : '0.0.0';
+export const packagePublisher = typeof EXTENSION_PUBLISHER !== 'undefined'
+  ? EXTENSION_PUBLISHER
+  : 'vscode-samples';
 export const isNightly = packageName.includes('nightly');
 export const extensionId = `${packagePublisher}.${packageName}`;

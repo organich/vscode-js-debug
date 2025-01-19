@@ -50,11 +50,13 @@ export class ExcludedCaller {
       vscode.TreeItemCollapsibleState.None,
     );
 
-    this.treeItem.tooltip = `Breaks at ${fullLabel(target)} containing ${fullLabel(
-      caller,
-    )} will be skipped`;
+    this.treeItem.tooltip = `Breaks at ${fullLabel(target)} containing ${
+      fullLabel(
+        caller,
+      )
+    } will be skipped`;
 
-    this.id = this.treeItem.id = createHash('sha1')
+    this.id = this.treeItem.id = createHash('sha256')
       .update(JSON.stringify([caller, target]))
       .digest('base64');
   }
@@ -75,7 +77,9 @@ export class ExcludedCallersUI
   private allCallers = new Map<string, ExcludedCaller>();
   private lastHadCallers = false;
 
-  constructor(@inject(DebugSessionTracker) private readonly sessionTracker: DebugSessionTracker) {}
+  constructor(
+    @inject(DebugSessionTracker) private readonly sessionTracker: DebugSessionTracker,
+  ) {}
 
   /** @inheritdoc */
   register(context: vscode.ExtensionContext): void {
@@ -121,7 +125,7 @@ export class ExcludedCallersUI
         this.allCallers.delete(c.id);
         this.triggerUpdate();
       }),
-      registerCommand(vscode.commands, Commands.CallersRemoveAll, async () => {
+      registerCommand(vscode.commands, Commands.CallersRemoveAll, () => {
         this.allCallers.clear();
         this.triggerUpdate();
       }),

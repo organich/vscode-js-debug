@@ -2,10 +2,10 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { injectable } from 'inversify';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import * as nls from 'vscode-nls';
 import { DebugType, getPreferredOrDebugType } from '../../common/contributionUtils';
 import { flatten } from '../../common/objUtils';
 import {
@@ -21,10 +21,10 @@ import { getPackageManager } from '../getRunScriptCommand';
 import { BaseConfigurationProvider } from './baseConfigurationProvider';
 import { createLaunchConfigFromContext } from './nodeDebugConfigurationResolver';
 
-const localize = nls.loadMessageBundle();
-
 @injectable()
-export class NodeInitialDebugConfigurationProvider extends BaseConfigurationProvider<AnyNodeConfiguration> {
+export class NodeInitialDebugConfigurationProvider
+  extends BaseConfigurationProvider<AnyNodeConfiguration>
+{
   protected provide(folder?: vscode.WorkspaceFolder) {
     return createLaunchConfigFromContext(folder, true);
   }
@@ -58,7 +58,10 @@ export class NodeDynamicDebugConfigurationProvider extends BaseConfigurationProv
         for (const key of keysToRelativize) {
           const value = config[key];
           if (value && path.isAbsolute(value)) {
-            config[key] = path.join('${workspaceFolder}', path.relative(folder.uri.fsPath, value));
+            config[key] = path.join(
+              '${workspaceFolder}',
+              path.relative(folder.uri.fsPath, value),
+            );
           }
         }
       }
@@ -81,7 +84,7 @@ export class NodeDynamicDebugConfigurationProvider extends BaseConfigurationProv
   protected async getFromNpmScripts(folder?: vscode.WorkspaceFolder): Promise<DynamicConfig[]> {
     const openTerminal: AnyResolvingConfiguration = {
       type: getPreferredOrDebugType(DebugType.Terminal),
-      name: localize('debug.terminal.label', 'JavaScript Debug Terminal'),
+      name: l10n.t('JavaScript Debug Terminal'),
       request: 'launch',
       cwd: folder?.uri.fsPath,
     };
@@ -99,7 +102,7 @@ export class NodeDynamicDebugConfigurationProvider extends BaseConfigurationProv
     return scripts
       .map<DynamicConfig>(script => ({
         type: getPreferredOrDebugType(DebugType.Terminal),
-        name: localize('node.launch.script', 'Run Script: {0}', script.name),
+        name: l10n.t('Run Script: {0}', script.name),
         request: 'launch',
         command: `${packageManager} run ${script.name}`,
         cwd: script.directory,
@@ -113,9 +116,9 @@ export class NodeDynamicDebugConfigurationProvider extends BaseConfigurationProv
   protected getFromActiveFile(): DynamicConfig[] {
     const editor = vscode.window.activeTextEditor;
     if (
-      !editor ||
-      !breakpointLanguages.includes(editor.document.languageId) ||
-      editor.document.uri.scheme !== 'file'
+      !editor
+      || !breakpointLanguages.includes(editor.document.languageId)
+      || editor.document.uri.scheme !== 'file'
     ) {
       return [];
     }
@@ -123,7 +126,7 @@ export class NodeDynamicDebugConfigurationProvider extends BaseConfigurationProv
     return [
       {
         type: getPreferredOrDebugType(DebugType.Node),
-        name: localize('node.launch.currentFile', 'Run Current File'),
+        name: l10n.t('Run Current File'),
         request: 'launch',
         program: editor.document.uri.fsPath,
       },

@@ -79,6 +79,7 @@ export interface ITarget {
   initialize(): Promise<void>;
   waitingForDebugger(): boolean;
   supportsCustomBreakpoints(): boolean;
+  supportsXHRBreakpoints(): boolean;
   scriptUrlToUrl(url: string): string;
   executionContextName(context: Cdp.Runtime.ExecutionContextDescription): string;
   entryBreakpoint?: IBreakpointPathAndId | undefined;
@@ -136,13 +137,11 @@ export interface ILauncher extends IDisposable {
 
   /**
    * Terminates the debugged process. This should be idempotent.
+   * @param terminateDebuggee Whether the debugee should be terminated as well.
+   * For `launch` type requests, this has no effect, but attach requests should
+   * use "stop" logic instead of "disconnect" logic when provided.
    */
-  terminate(): Promise<void>;
-
-  /**
-   * Disconnects from the debugged process. This should be idempotent.
-   */
-  disconnect(): Promise<void>;
+  terminate(terminateDebuggee?: boolean): Promise<void>;
 
   /**
    * Attempts to restart the debugged process. This may no-op for certain

@@ -2,15 +2,13 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { createWriteStream, WriteStream } from 'fs';
 import { inject, injectable } from 'inversify';
-import * as nls from 'vscode-nls';
-import { IProfile, IProfiler, StartProfileParams } from '.';
 import Cdp from '../../cdp/api';
 import { ICdpApi } from '../../cdp/connection';
 import { EventEmitter } from '../../common/events';
-
-const localize = nls.loadMessageBundle();
+import { IProfile, IProfiler, StartProfileParams } from '.';
 
 /**
  * Basic instant that uses the HeapProfiler API to grab a snapshot.
@@ -19,10 +17,9 @@ const localize = nls.loadMessageBundle();
 export class HeapDumpProfiler implements IProfiler<void> {
   public static readonly type = 'memory';
   public static readonly extension = '.heapsnapshot';
-  public static readonly label = localize('profile.heap.label', 'Heap Snapshot');
-  public static readonly description = localize(
-    'profile.heap.description',
-    'Generates a .heapsnapshot file you can open in the Chrome devtools',
+  public static readonly label = l10n.t('Heap Snapshot');
+  public static readonly description = l10n.t(
+    'Generates a .heapsnapshot file you can open in VS Code or the Edge/Chrome devtools',
   );
   public static readonly instant = true;
 
@@ -36,8 +33,9 @@ export class HeapDumpProfiler implements IProfiler<void> {
   };
 
   constructor(@inject(ICdpApi) private readonly cdp: Cdp.Api) {
-    this.cdp.HeapProfiler.on('addHeapSnapshotChunk', ({ chunk }) =>
-      this.currentWriter?.stream.write(chunk),
+    this.cdp.HeapProfiler.on(
+      'addHeapSnapshotChunk',
+      ({ chunk }) => this.currentWriter?.stream.write(chunk),
     );
   }
 

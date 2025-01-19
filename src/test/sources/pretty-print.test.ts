@@ -26,7 +26,7 @@ describe('pretty print sources', () => {
     stopped();
   };
 
-  itIntegrates('base', async function ({ r }) {
+  itIntegrates('base', async function({ r }) {
     const p = await r.launchUrl('pretty/pretty.html');
     const source = { path: p.workspacePath('web/pretty/ugly.js') };
     await p.dap.setBreakpoints({ source, breakpoints: [{ line: 5, column: 1 }] });
@@ -70,8 +70,11 @@ describe('pretty print sources', () => {
     });
     p.load();
 
-    p.log(await p.dap.once('breakpoint'));
-    const { threadId } = p.log(await p.dap.once('stopped'));
+    const stopped = p.dap.once('stopped');
+    for (let i = 0; i < 2; i++) {
+      p.log(await p.dap.once('breakpoint'));
+    }
+    const { threadId } = p.log(await stopped);
     p.dap.prettyPrintSource({ source });
     const pretty = p.dap.once('loadedSource');
 
@@ -102,7 +105,7 @@ describe('pretty print sources', () => {
     p.assertLog();
   });
 
-  itIntegrates('eval sources (#929)', async function ({ r }) {
+  itIntegrates('eval sources (#929)', async function({ r }) {
     const p = await r.launchUrlAndLoad('index.html');
     await p.load();
 

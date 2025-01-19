@@ -8,6 +8,7 @@ import { parse as urlParse, URL } from 'url';
 import Cdp from '../cdp/api';
 import { AnyChromiumConfiguration } from '../configuration';
 import { BrowserTargetType } from '../targets/browser/browserTargets';
+import { iteratorFirst } from './arrayUtils';
 import { MapUsingProjection } from './datastructure/mapUsingProjection';
 import { IFsUtils } from './fsUtils';
 import { memoize } from './objUtils';
@@ -57,8 +58,9 @@ export function caseNormalizedMap<V>(): Map<string, V> {
   return getCaseSensitivePaths() ? new Map() : new MapUsingProjection(lowerCaseInsensitivePath);
 }
 
-const win32PathExt =
-  process.platform === 'win32' ? process.env.PATHEXT?.toLowerCase().split(';') : undefined;
+const win32PathExt = process.platform === 'win32'
+  ? process.env.PATHEXT?.toLowerCase().split(';')
+  : undefined;
 
 /**
  * Gets a case-normalized binary name suitable for comparison. On Windows,
@@ -78,15 +80,16 @@ export const getNormalizedBinaryName = (binaryPath: string) => {
 };
 
 /**
- * Returns the closest parent directory where the predicate returns true.
+ * Returns the closest parent directory where the predicate returns truthy.
  */
-export const nearestDirectoryWhere = async (
+export const nearestDirectoryWhere = async <T>(
   rootDir: string,
-  predicate: (dir: string) => Promise<boolean>,
-): Promise<string | undefined> => {
+  predicate: (dir: string) => Promise<T | undefined>,
+): Promise<T | undefined> => {
   while (true) {
-    if (await predicate(rootDir)) {
-      return rootDir;
+    const value = await predicate(rootDir);
+    if (value !== undefined) {
+      return value;
     }
 
     const parent = path.dirname(rootDir);
@@ -102,7 +105,10 @@ export const nearestDirectoryWhere = async (
  * Returns the closest parent directory that contains a file with the given name.
  */
 export const nearestDirectoryContaining = (fsUtils: IFsUtils, rootDir: string, file: string) =>
-  nearestDirectoryWhere(rootDir, p => fsUtils.exists(path.join(p, file)));
+  nearestDirectoryWhere<string>(
+    rootDir,
+    async p => (await fsUtils.exists(path.join(p, file))) ? p : undefined,
+  );
 
 // todo: not super correct, and most node libraries don't handle this accurately
 const knownLoopbacks = new Set<string>(['localhost', '127.0.0.1', '::1']);
@@ -170,6 +176,15 @@ export function removeQueryString(url: string) {
     return parsed.toString();
   } catch {
     return url;
+  }
+}
+
+export function getPathName(url: string) {
+  try {
+    const parsed = new URL(url);
+    return parsed.pathname;
+  } catch {
+    return undefined;
   }
 }
 
@@ -246,6 +261,7 @@ export function stripTrailingSlash(aPath: string): string {
 
 const vscodeWebviewResourceSchemeRe =
   /^https:\/\/([a-z0-9\-]+)\+\.vscode-resource\.vscode-(?:webview|cdn)\.net\/(.+)/i;
+const vscodeAppResource = 'vscode-file://vscode-app/';
 
 /**
  * If urlOrPath is a file URL, removes the 'file:///', adjusting for platform differences
@@ -269,6 +285,8 @@ export function fileUrlToAbsolutePath(urlOrPath: string): string | undefined {
           return `${scheme}://`; // Url has own authority.
         }
       });
+  } else if (urlOrPath.startsWith(vscodeAppResource)) {
+    urlOrPath = urlOrPath.slice(vscodeAppResource.length);
   } else if (!isFileUrl(urlOrPath)) {
     return undefined;
   }
@@ -309,7 +327,8 @@ export function fileUrlToNetworkPath(urlOrPath: string): string {
   return urlOrPath;
 }
 
-// TODO: this does not escape/unescape special characters, but it should.
+// TODO: this does not escape/unescape special characters
+/** @deprecated consider absolutePathToFileUrlWithDetection instead */
 export function absolutePathToFileUrl(absolutePath: string): string {
   if (!isAbsolute(absolutePath)) {
     throw new Error(
@@ -317,6 +336,18 @@ export function absolutePathToFileUrl(absolutePath: string): string {
     );
   }
   if (platform === 'win32') {
+    return 'file:///' + platformPathToUrlPath(absolutePath);
+  }
+  return 'file://' + platformPathToUrlPath(absolutePath);
+}
+
+/**
+ * Absolte path former that detects the platform based on the absolutePath
+ * itself, rather than the platform where the debugger is running. This is
+ * different from {@link absolutePathToFileUrl}, but should be more correct.
+ */
+export function absolutePathToFileUrlWithDetection(absolutePath: string): string {
+  if (!absolutePath.startsWith('/')) {
     return 'file:///' + platformPathToUrlPath(absolutePath);
   }
   return 'file://' + platformPathToUrlPath(absolutePath);
@@ -364,7 +395,7 @@ const createReGroup = (patterns: ReadonlySet<string>): string => {
     case 0:
       return '';
     case 1:
-      return patterns.values().next().value;
+      return iteratorFirst(patterns.values()) as string;
     default:
       // Prefer the more compacy [aA] form if we're only matching single
       // characters, produce a non-capturing group otherwise.
@@ -374,14 +405,20 @@ const createReGroup = (patterns: ReadonlySet<string>): string => {
 };
 
 const charToUrlReGroupSet = new Set<string>();
-const charRangeToUrlReGroup = (str: string, start: number, end: number, escapeRegex: boolean) => {
+export function charRangeToUrlReGroup(
+  str: string,
+  start: number,
+  end: number,
+  escapeRegex: boolean,
+  _isCaseSensitive = isCaseSensitive,
+) {
   let re = '';
 
   // Loop through each character of the string. Convert the char to a regex,
   // creating a group, and then append that to the match.
   // Note that using "for..of" is important here to loop over UTF code points.
   for (const char of str.slice(start, end)) {
-    if (isCaseSensitive) {
+    if (_isCaseSensitive) {
       urlToRegexChar(char, charToUrlReGroupSet, escapeRegex);
     } else {
       urlToRegexChar(char.toLowerCase(), charToUrlReGroupSet, escapeRegex);
@@ -392,7 +429,7 @@ const charRangeToUrlReGroup = (str: string, start: number, end: number, escapeRe
     charToUrlReGroupSet.clear();
   }
   return re;
-};
+}
 
 /**
  * Converts and escape the file URL to a regular expression.
@@ -463,11 +500,12 @@ export function maybeAbsolutePathToFileUrl(
   sourceUrl: string,
 ): string {
   if (
-    rootPath &&
-    platformPathToPreferredCase(sourceUrl).startsWith(rootPath) &&
-    !isValidUrl(sourceUrl)
-  )
+    rootPath
+    && platformPathToPreferredCase(sourceUrl).startsWith(rootPath)
+    && !isValidUrl(sourceUrl)
+  ) {
     return absolutePathToFileUrl(sourceUrl);
+  }
   return sourceUrl;
 }
 
@@ -520,23 +558,21 @@ export type TargetFilter = (info: Cdp.Target.TargetInfo) => boolean;
 export const createTargetFilterForConfig = (
   config: AnyChromiumConfiguration,
   additonalMatches: ReadonlyArray<string> = [],
-): ((t: { url: string }) => boolean) => {
-  const filter = config.urlFilter || config.url || ('file' in config && config.file);
-  if (!filter) {
-    return () => true;
-  }
-
-  const tester = createTargetFilter(filter, ...additonalMatches);
-  return t => tester(t.url);
+): (t: { url: string }) => boolean => {
+  const filter = config.urlFilter || ('file' in config && config.file) || config.url;
+  const tester = filter ? createTargetFilter(filter, ...additonalMatches) : undefined;
+  return t => !t.url.startsWith('devtools://') && tester?.(t.url) !== false;
 };
 
 /**
  * Requires that the target is also a 'page'.
  */
-export const requirePageTarget =
-  <T>(filter: (t: T) => boolean): ((t: T & { type: string }) => boolean) =>
-  t =>
-    t.type === BrowserTargetType.Page && filter(t);
+export const requirePageTarget = (
+  filter: (t: Cdp.Target.TargetInfo) => boolean,
+): (t: Cdp.Target.TargetInfo & { type: string }) => boolean =>
+t =>
+  // avoid #2018
+  t.type === BrowserTargetType.Page && !t.url.startsWith('edge://force-signin') && filter(t);
 
 /**
  * The "isURL" from chrome-debug-core. In js-debug we use `new URL()` to see
@@ -552,7 +588,7 @@ function isURLCompat(urlOrPath: string): boolean {
  */
 export const createTargetFilter = (
   ...targetUrls: ReadonlyArray<string>
-): ((testUrl: string) => boolean) => {
+): (testUrl: string) => boolean => {
   const standardizeMatch = (aUrl: string) => {
     aUrl = aUrl.toLowerCase();
 
@@ -579,7 +615,7 @@ export const createTargetFilter = (
   };
 
   const escaped = targetUrls.map(url =>
-    escapeRegexSpecialChars(standardizeMatch(url), '/*').replace(/(\/\*$)|\*/g, '.*'),
+    escapeRegexSpecialChars(standardizeMatch(url), '/*').replace(/(\/\*$)|\*/g, '.*')
   );
   const targetUrlRegex = new RegExp('^(' + escaped.join('|') + ')$', 'g');
 

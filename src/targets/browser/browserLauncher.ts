@@ -2,18 +2,20 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import { IBrowserFinder, isQuality, Quality } from '@vscode/js-debug-browsers';
+import { IBrowserFinder, isQuality } from '@vscode/js-debug-browsers';
+import * as l10n from '@vscode/l10n';
 import * as fs from 'fs';
 import { inject, injectable } from 'inversify';
 import * as path from 'path';
 import { CancellationToken } from 'vscode';
 import CdpConnection from '../../cdp/connection';
-import { timeoutPromise } from '../../common/cancellation';
+import { CancellationTokenSource, timeoutPromise } from '../../common/cancellation';
 import { DisposableList } from '../../common/disposable';
 import { EnvironmentVars } from '../../common/environmentVars';
 import { EventEmitter } from '../../common/events';
 import { existsInjected } from '../../common/fsUtils';
 import { ILogger } from '../../common/logging';
+import { delay } from '../../common/promiseUtil';
 import { ISourcePathResolver } from '../../common/sourcePathResolver';
 import {
   absolutePathToFileUrl,
@@ -41,13 +43,12 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
 {
   private _connectionForTest: CdpConnection | undefined;
   private _targetManager: BrowserTargetManager | undefined;
-  private _launchParams: T | undefined;
   protected _disposables = new DisposableList();
-  private _terminated = false;
   private _onTerminatedEmitter = new EventEmitter<IStopMetadata>();
   readonly onTerminated = this._onTerminatedEmitter.event;
   private _onTargetListChangedEmitter = new EventEmitter<void>();
   readonly onTargetListChanged = this._onTargetListChangedEmitter.event;
+  private readonly _terminatedCts = new CancellationTokenSource();
 
   constructor(
     @inject(StoragePath) private readonly storagePath: string,
@@ -92,23 +93,28 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
     telemetryReporter: ITelemetryReporter,
     promisedPort?: Promise<number>,
   ): Promise<launcher.ILaunchResult> {
-    const executablePath = await this.findBrowserPath(executable || Quality.Stable);
+    const executablePath = await this.findBrowserPath(executable || 'stable');
 
     // If we had a custom executable, don't resolve a data
     // dir unless it's  explicitly requested.
     let resolvedDataDir: string | undefined;
     if (typeof userDataDir === 'string') {
-      resolvedDataDir = userDataDir;
+      resolvedDataDir = path.resolve(userDataDir);
     } else if (userDataDir) {
-      resolvedDataDir = path.join(
-        this.storagePath,
-        runtimeArgs?.includes('--headless') ? '.headless-profile' : '.profile',
+      resolvedDataDir = path.resolve(
+        path.join(
+          this.storagePath,
+          runtimeArgs?.includes('--headless') ? '.headless-profile' : '.profile',
+        ),
       );
     }
 
-    try {
-      fs.mkdirSync(this.storagePath);
-    } catch (e) {}
+    fs.mkdirSync(this.storagePath, { recursive: true });
+
+    if (resolvedDataDir) {
+      fs.mkdirSync(resolvedDataDir, { recursive: true });
+      resolvedDataDir = fs.realpathSync(resolvedDataDir);
+    }
 
     return await launcher.launch(
       dap,
@@ -146,37 +152,122 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
    * Starts the launch process. It boots the browser and waits until the target
    * page is available, and then returns the newly-created target.
    */
-  private async prepareLaunch(
-    params: T,
-    { dap, targetOrigin, cancellationToken, telemetryReporter }: ILaunchContext,
-  ): Promise<BrowserTarget> {
+  private async doLaunch(params: T, ctx: ILaunchContext): Promise<void> {
     let launched: launcher.ILaunchResult;
     try {
-      launched = await this.launchBrowser(params, dap, cancellationToken, telemetryReporter);
+      launched = await this.launchBrowser(
+        params,
+        ctx.dap,
+        ctx.cancellationToken,
+        ctx.telemetryReporter,
+      );
     } catch (e) {
       throw new ProtocolError(browserLaunchFailed(e));
     }
 
-    this._disposables.push(launched.cdp.onDisconnected(() => this.fireTerminatedEvent()));
-    this._connectionForTest = launched.cdp;
-    this._launchParams = params;
+    // Note: we have a different token for the launch loop, since the initial
+    // launch token is cancelled when that finishes. Instead, this token is
+    // good until the debug session is terminated, once the initial session
+    // has been craeted.
+    const launchCts = new CancellationTokenSource(this._terminatedCts.token);
+
+    // Retry connections as long as the launch process is running,
+    // reconnections are allowed, and this debug session hasn't been terminated.
+    launched.process.onExit(() => this.fireTerminatedEvent());
+    const canRetry = () => launched.canReconnect && !launchCts.token.isCancellationRequested;
+
+    const onConnectionFailed = async (err?: Error): Promise<void> => {
+      // cleanup old target manager immediately so sessions are reflected
+      this._targetManager?.dispose();
+      this._targetManager = undefined;
+      this._onTargetListChangedEmitter.fire();
+
+      if (canRetry()) {
+        // this looks ugly, because it is... if the browser is closed by the
+        // user, we'll generally notice the CDP connection is closed before the
+        // process' exit event happens, so add an extra delay to double check
+        // that a retry is appropriate to avoid extranous logs.
+        await delay(1000);
+        if (canRetry()) {
+          ctx.dap.output({
+            category: 'stderr',
+            output: l10n.t(
+              'Browser connection failed, will retry: {0}',
+              err?.message || 'Connection closed',
+            ),
+          });
+
+          try {
+            await delay(2000);
+            return await launchInner();
+          } catch {
+            // caught in here because twe could no longer retry. fall through.
+          }
+        }
+      }
+
+      launched.process.kill();
+      this.fireTerminatedEvent();
+    };
+
+    const launchInner = async (): Promise<void> => {
+      if (launchCts.token.isCancellationRequested) {
+        return;
+      }
+
+      try {
+        const cdp = await launched.createConnection(launchCts.token);
+
+        const target = await this.launchCdp(params, launched, cdp, {
+          ...ctx,
+          cancellationToken: launchCts.token,
+        });
+        await this.finishLaunch(target, params);
+        cdp.onDisconnected(() => onConnectionFailed());
+      } catch (e) {
+        if (canRetry()) {
+          return onConnectionFailed(e);
+        } else {
+          launched.process.kill();
+          throw new ProtocolError(browserLaunchFailed(e));
+        }
+      }
+    };
+
+    const launchTokenListener = ctx.cancellationToken.onCancellationRequested(() =>
+      launchCts.cancel()
+    );
+
+    try {
+      await launchInner();
+    } finally {
+      launchTokenListener.dispose();
+    }
+  }
+
+  private async launchCdp(
+    params: T,
+    launched: launcher.ILaunchResult,
+    cdp: CdpConnection,
+    ctx: ILaunchContext,
+  ) {
+    this._connectionForTest = cdp;
 
     this._targetManager = await BrowserTargetManager.connect(
-      launched.cdp,
+      cdp,
       launched.process,
       this.pathResolver,
-      this._launchParams,
+      params,
       this.logger,
-      telemetryReporter,
-      targetOrigin,
+      ctx.telemetryReporter,
+      ctx.targetOrigin,
     );
     if (!this._targetManager) {
-      launched.process.kill();
       throw new ProtocolError(browserAttachFailed());
     }
 
     this._targetManager.serviceWorkerModel.onDidChange(() =>
-      this._onTargetListChangedEmitter.fire(),
+      this._onTargetListChangedEmitter.fire()
     );
     this._targetManager.frameModel.onFrameNavigated(() => this._onTargetListChangedEmitter.fire());
     this._disposables.push(this._targetManager);
@@ -193,12 +284,11 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
     const filter = this.getFilterForTarget(params);
     const mainTarget = await timeoutPromise(
       this._targetManager.waitForMainTarget(filter),
-      cancellationToken,
+      ctx.cancellationToken,
       'Could not attach to main target',
     );
 
     if (!mainTarget) {
-      launched.process.kill(); // no need to check the `cleanUp` preference since no tabs will be open
       throw new ProtocolError(targetPageNotFound());
     }
 
@@ -250,8 +340,7 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
       return { blockSessionTermination: false };
     }
 
-    const target = await this.prepareLaunch(resolved, context);
-    await this.finishLaunch(target, resolved);
+    await this.doLaunch(resolved, context);
     return { blockSessionTermination: true };
   }
 
@@ -265,18 +354,11 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
    * @inheritdoc
    */
   public async terminate(): Promise<void> {
-    for (const target of this.targetList() as BrowserTarget[]) {
-      if (target.type() === BrowserTargetType.Page) {
-        await target.cdp().Page.close({});
-      }
+    if (this._targetManager) {
+      await this._targetManager.closeBrowser();
+    } else {
+      this.fireTerminatedEvent();
     }
-  }
-
-  /**
-   * @inheritdoc
-   */
-  public async disconnect(): Promise<void> {
-    await this._targetManager?.closeBrowser();
   }
 
   /**
@@ -297,8 +379,8 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
     if (executablePath === '*') {
       // try to find the stable browser, but if that fails just get any browser
       // that's available on the system
-      const found =
-        (await finder.findWhere(r => r.quality === Quality.Stable)) || (await finder.findAll())[0];
+      const found = (await finder.findWhere(r => r.quality === 'stable'))
+        || (await finder.findAll())[0];
       return found?.path;
     } else if (isQuality(executablePath)) {
       return (await finder.findWhere(r => r.quality === executablePath))?.path;
@@ -317,8 +399,8 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
   }
 
   fireTerminatedEvent() {
-    if (!this._terminated) {
-      this._terminated = true;
+    if (!this._terminatedCts.token.isCancellationRequested) {
+      this._terminatedCts.cancel();
       this._onTerminatedEmitter.fire({ code: 0, killed: true });
     }
   }

@@ -42,7 +42,7 @@ export interface IProfiler<T> {
 }
 
 export interface IProfilerCtor {
-  new (...args: never[]): IProfiler<unknown>;
+  new(...args: never[]): IProfiler<unknown>;
 
   /**
    * Profiler type given in the DAP API.
@@ -90,6 +90,24 @@ export interface IProfilerFactory {
    */
   get<T>(type: string): IProfiler<T>;
 }
+
+/**
+ * Gets a default profile file name (without an extension)
+ */
+export const getDefaultProfileName = () => {
+  const now = new Date();
+  return [
+    'vscode-profile',
+    now.getFullYear(),
+    now.getMonth() + 1,
+    now.getDate(),
+    now.getHours(),
+    now.getMinutes(),
+    now.getSeconds(),
+  ]
+    .map(n => String(n).padStart(2, '0'))
+    .join('-');
+};
 
 /**
  * Simple class that gets profilers

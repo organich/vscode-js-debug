@@ -22,7 +22,7 @@ import { EnvironmentVars } from '../../common/environmentVars';
 import { EventEmitter } from '../../common/events';
 import { ILogger, LogTag } from '../../common/logging';
 import { once } from '../../common/objUtils';
-import { findInPath, forceForwardSlashes } from '../../common/pathUtils';
+import { findInPath, forceForwardSlashes, getRandomPipe } from '../../common/pathUtils';
 import { delay } from '../../common/promiseUtil';
 import { AnyLaunchConfiguration, AnyNodeConfiguration } from '../../configuration';
 import { cannotLoadEnvironmentVars } from '../../dap/errors';
@@ -36,7 +36,11 @@ import {
 } from '../../targets/targets';
 import { ITelemetryReporter } from '../../telemetry/telemetryReporter';
 import { ISourcePathResolverFactory } from '../sourcePathResolverFactory';
-import { IBootloaderEnvironment, IBootloaderInfo } from './bootloader/environment';
+import {
+  IBootloaderEnvironment,
+  IBootloaderInfo,
+  variableDelimiter,
+} from './bootloader/environment';
 import { bootloaderDefaultPath } from './bundlePaths';
 import { Capability, INodeBinaryProvider, NodeBinary } from './nodeBinaryProvider';
 import { NodeSourcePathResolver } from './nodeSourcePathResolver';
@@ -81,8 +85,6 @@ export interface IRunData<T> {
   logger: ILogger;
   params: T;
 }
-
-let counter = 0;
 
 @injectable()
 export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implements ILauncher {
@@ -132,8 +134,8 @@ export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implement
     @inject(INodeBinaryProvider) private readonly pathProvider: INodeBinaryProvider,
     @inject(ILogger) protected readonly logger: ILogger,
     @inject(IPortLeaseTracker) protected readonly portLeaseTracker: IPortLeaseTracker,
-    @inject(ISourcePathResolverFactory)
-    protected readonly pathResolverFactory: ISourcePathResolverFactory,
+    @inject(ISourcePathResolverFactory) protected readonly pathResolverFactory:
+      ISourcePathResolverFactory,
   ) {}
 
   /**
@@ -180,13 +182,6 @@ export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implement
   }
 
   /**
-   * @inheritdoc
-   */
-  public async disconnect(): Promise<void> {
-    await this.terminate();
-  }
-
-  /**
    * Restarts the ongoing program.
    */
   public async restart(newParams: AnyLaunchConfiguration): Promise<void> {
@@ -217,10 +212,9 @@ export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implement
       params: newParams ? this.resolveParams(newParams) ?? this.run.params : this.run.params,
       context: {
         ...this.run.context,
-        cancellationToken:
-          this.run.params.timeout > 0
-            ? CancellationTokenSource.withTimeout(this.run.params.timeout).token
-            : NeverCancelled,
+        cancellationToken: this.run.params.timeout > 0
+          ? CancellationTokenSource.withTimeout(this.run.params.timeout).token
+          : NeverCancelled,
       },
     });
   }
@@ -309,10 +303,9 @@ export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implement
       // environments. Bootloader will replace this with actual node executable used if any.
       execPath: await findInPath(fs.promises, 'node', process.env),
       onlyEntrypoint: !params.autoAttachChildProcesses,
-      verbose:
-        params.trace === true || (typeof params.trace === 'object' && params.trace.stdio)
-          ? true
-          : undefined,
+      verbose: params.trace === true || (typeof params.trace === 'object' && params.trace.stdio)
+        ? true
+        : undefined,
       autoAttachMode: AutoAttachMode.Always,
       mandatePortTracking: this.portLeaseTracker.isMandated ? true : undefined,
       ...additionalOptions,
@@ -321,14 +314,14 @@ export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implement
     const env = {
       // Require our bootloader first, to run it before any other bootloader
       // we could have injected in the parent process.
-      NODE_OPTIONS: `--require ${bootloader.interpolatedPath}`,
-      VSCODE_INSPECTOR_OPTIONS: JSON.stringify(bootloaderInfo),
+      NODE_OPTIONS: ` --require ${bootloader.interpolatedPath} `,
+      VSCODE_INSPECTOR_OPTIONS: variableDelimiter + JSON.stringify(bootloaderInfo),
       ELECTRON_RUN_AS_NODE: null,
     } as IBootloaderEnvironment;
 
     const baseEnvOpts = baseEnv.lookup('NODE_OPTIONS');
     if (baseEnvOpts) {
-      env.NODE_OPTIONS += ` ${baseEnvOpts}`;
+      env.NODE_OPTIONS += ` ${baseEnvOpts} `;
     }
 
     const globalOpts = EnvironmentVars.processEnv().lookup('NODE_OPTIONS');
@@ -354,8 +347,7 @@ export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implement
   }
 
   protected async _startServer(telemetryReporter: ITelemetryReporter) {
-    const pipePrefix = process.platform === 'win32' ? '\\\\.\\pipe\\' : os.tmpdir();
-    const pipe = path.join(pipePrefix, `node-cdp.${process.pid}-${++counter}.sock`);
+    const pipe = getRandomPipe();
     const server = await new Promise<net.Server>((resolve, reject) => {
       const s = net
         .createServer(socket => this._startSession(socket, telemetryReporter))
@@ -467,7 +459,7 @@ export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implement
 
     const cdp = connection.rootSession();
     const { targetInfo } = await new Promise<Cdp.Target.TargetCreatedEvent>(f =>
-      cdp.Target.on('targetCreated', f),
+      cdp.Target.on('targetCreated', f)
     );
 
     const cast = targetInfo as WatchdogTarget;
@@ -524,7 +516,7 @@ export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implement
   protected async gatherTelemetryFromCdp(
     cdp: Cdp.Api,
     run: IRunData<T>,
-  ): Promise<IProcessTelemetry | void> {
+  ): Promise<IProcessTelemetry | undefined> {
     for (let retries = 0; retries < 8; retries++) {
       const telemetry = await cdp.Runtime.evaluate({
         contextId: 1,
@@ -532,8 +524,8 @@ export abstract class NodeLauncherBase<T extends AnyNodeConfiguration> implement
         // note: for some bizarre reason, if launched with --inspect-brk, the
         // process.pid in extension host debugging is initially undefined.
         expression:
-          `typeof process === 'undefined' || process.pid === undefined ? 'process not defined' : ({ processId: process.pid, nodeVersion: process.version, architecture: process.arch })` +
-          getSourceSuffix(),
+          `typeof process === 'undefined' || process.pid === undefined ? 'process not defined' : ({ processId: process.pid, nodeVersion: process.version, architecture: process.arch })`
+          + getSourceSuffix(),
       });
 
       if (!this.program) {

@@ -2,6 +2,9 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import { OutputSource } from '../../configuration';
+import { createFileTree } from '../createFileTree';
+import { testFixturesDir } from '../test';
 import { itIntegrates } from '../testIntegrationUtils';
 
 describe('console format', () => {
@@ -26,6 +29,28 @@ describe('console format', () => {
       `console.log("%%%s self-escape6", "dummy");`,
     ]);
     p.assertLog();
+  });
+
+  itIntegrates('string format', async ({ r }) => {
+    const handle = await r.launchUrl('stringFormats.html');
+    handle.load();
+
+    const obj = await handle.dap.once('output');
+    for (let i = 0; i < 4; i++) {
+      // xa - xd
+      await handle.logger.logOutput(await handle.dap.once('output'));
+    }
+    await handle.logger.logOutput(obj);
+
+    for (const context of ['hover', 'repl'] as const) {
+      await handle.logger.evaluateAndLog('obj', { depth: 1 }, context);
+      await handle.logger.evaluateAndLog('xa', { depth: 1 }, context);
+      await handle.logger.evaluateAndLog('xb', { depth: 1 }, context);
+      await handle.logger.evaluateAndLog('xc', { depth: 1 }, context);
+      await handle.logger.evaluateAndLog('xd', { depth: 1 }, context);
+    }
+
+    handle.assertLog();
   });
 
   itIntegrates('popular types', async ({ r }) => {
@@ -130,6 +155,9 @@ describe('console format', () => {
       'new Set([1, 2, 3, 4])',
       'new Set([1, 2, 3, 4, 5, 6, 7, 8])',
       'new class { toString() { return "custom to string" } }',
+      'new class { toString() { return "long custom to string".repeat(500) } }',
+      'new class { [Symbol.for("debug.description")]() { return "some custom repr" } }',
+      'new class { [Symbol.for("nodejs.util.inspect.custom")](depth) { return "some node repr, depth: " + depth } }',
     ];
     const expressions = variables.map(v => [`console.log(${v})`, `console.log([${v}])`]);
     await p.logger.evaluateAndLog(([] as string[]).concat(...expressions), { depth: 0 });
@@ -144,6 +172,19 @@ describe('console format', () => {
           toString() { return "hello b" }
         }
         toString() { return "hello a" }
+      }
+    `);
+    p.assertLog();
+  });
+
+  itIntegrates('custom symbol', async ({ r }) => {
+    const p = await r.launchAndLoad('blank');
+    await p.logger.evaluateAndLog(`
+      new class A {
+        prop = new class B {
+          [Symbol.for("debug.description")]() { return "hello b" }
+        };
+        [Symbol.for("debug.description")]() { return "hello a" }
       }
     `);
     p.assertLog();
@@ -451,7 +492,42 @@ describe('console format', () => {
     });
     const output = await handle.dap.once('output');
     await evaluation;
-    handle.log(`logged ${output.output} at ${output.source?.name}:${output.line}:${output.column}`);
+    handle.log(
+      `logged ${output.output} at ${output.source?.name}:${output.line}:${output.column}`,
+    );
+    handle.assertLog();
+  });
+
+  itIntegrates('EXT handling', async ({ r }) => {
+    createFileTree(testFixturesDir, {
+      'test.js': [
+        `
+          process.stdout.write('hello');
+          debugger;
+          process.stdout.write('world');
+          debugger;
+          process.stdout.write('new line\\r\\nasdf');
+          debugger;
+          process.stdout.write('now ext\\u0003this should be bulked');
+          debugger;
+          process.stdout.write('with this!\\u0003trailing');
+        `,
+      ],
+    });
+    const handle = await r.runScript('test.js', { outputCapture: OutputSource.Stdio });
+    let output = '';
+    r.rootDap().on('output', o => {
+      output += o.output;
+    });
+
+    // use debugger statements to sync chunks of output
+    handle.dap.on('stopped', ev => {
+      handle.dap.continue({ threadId: ev.threadId! });
+    });
+
+    await handle.load();
+    await r.rootDap().once('terminated');
+    r.log(JSON.stringify(output));
     handle.assertLog();
   });
 });

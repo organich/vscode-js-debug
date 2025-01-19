@@ -20,8 +20,6 @@ describe('sources', () => {
         sourceReference: event.source.sourceReference,
       },
     });
-    p.log(`${content.mimeType}`);
-    p.log('---------');
     p.log(content.content);
     p.log('---------');
   }
@@ -36,8 +34,21 @@ describe('sources', () => {
     await dumpSource(p, await p.waitForSource('doesnotexist'), 'does not exist');
     p.addScriptTag('dir/helloworld.js');
     await dumpSource(p, await p.waitForSource('helloworld'), 'dir/helloworld');
-    p.evaluate('42', '');
-    await dumpSource(p, await p.waitForSource('eval'), 'eval');
+
+    p.log(await p.dap.loadedSources({}), '\nLoaded sources: ');
+    p.assertLog();
+  });
+
+  itIntegrates('lazily announces eval', async ({ r }) => {
+    const p = await r.launchUrlAndLoad('inlinescript.html');
+
+    const src = p.waitForSource('eval');
+    p.evaluate('42', ''); // sohuld never be announced
+    p.evaluate('window.hello = m => console.log(m)', ''); // announced when its source is in the console
+
+    p.evaluate('hello()');
+
+    await dumpSource(p, await src, 'eval');
     p.log(await p.dap.loadedSources({}), '\nLoaded sources: ');
     p.assertLog();
   });
@@ -221,6 +232,18 @@ describe('sources', () => {
     handle.assertLog();
   });
 
+  itIntegrates('applies sourcemap path mappings to sourceURLs (vscode#204784)', async ({ r }) => {
+    const handle = await r.launchUrl('vscode-204784/index.html', {
+      sourceMapPathOverrides: { 'mapped://*': '${workspaceFolder}/web/vscode-204784/*' },
+      resolveSourceMapLocations: ['${workspaceFolder}/web/vscode-204784/**'],
+    });
+
+    handle.load();
+    const src = await handle.waitForSource('original');
+    handle.log(src, undefined, []);
+    handle.assertLog();
+  });
+
   itIntegrates('removes any query from node paths (#529)', async ({ r }) => {
     const handle = await r.runScript(
       join(testWorkspace, 'simpleNode', 'simpleWebpackWithQuery.js'),
@@ -250,32 +273,6 @@ describe('sources', () => {
       const output = p.dap.once('output', o => o.category === 'stderr');
       await p.evaluate('//# sourceMappingURL=does-not-exist.js.map\n');
       await p.logger.logOutput(await output);
-      p.assertLog();
-    });
-
-    itIntegrates('logs lazy parse errors', async ({ r }) => {
-      const p = await r.launchUrlAndLoad('index.html');
-      await p.dap.setBreakpoints({
-        source: { path: p.workspacePath('web/eval1Source.js') },
-        breakpoints: [{ line: 1, column: 1 }],
-      });
-
-      const output = r.rootDap().once('output', o => o.category === 'stderr');
-      const contents = Buffer.from(
-        JSON.stringify({
-          version: 3,
-          file: 'eval1.js',
-          sourceRoot: '',
-          sources: ['eval1Source.js'],
-          mappings: '#,####;',
-        }),
-      ).toString('base64');
-      const ev = p.evaluate(
-        `//# sourceMappingURL=data:application/json;charset=utf-8;base64,${contents}\n`,
-      );
-      await p.logger.logOutput(await output);
-      await waitForPause(p);
-      await ev;
       p.assertLog();
     });
   });

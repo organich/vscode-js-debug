@@ -2,7 +2,7 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import * as nls from 'vscode-nls';
+import * as l10n from '@vscode/l10n';
 import Cdp from '../../cdp/api';
 import { once } from '../../common/objUtils';
 import { StackTraceParser } from '../../common/stackTraceParser';
@@ -10,18 +10,16 @@ import Dap from '../../dap/api';
 import { formatMessage } from '../messageFormat';
 import { messageFormatters, previewAsObject } from '../objectPreview';
 import { AnyObject } from '../objectPreview/betterTypes';
-import { IUiLocation } from '../sources';
+import { IUiLocation } from '../source';
 import { StackFrame, StackTrace } from '../stackTrace';
 import { Thread } from '../threads';
 import { IConsoleMessage } from './consoleMessage';
-
-const localize = nls.loadMessageBundle();
 
 export abstract class TextualMessage<T extends { stackTrace?: Cdp.Runtime.StackTrace }>
   implements IConsoleMessage
 {
   protected readonly stackTrace = once((thread: Thread) =>
-    this.event.stackTrace ? StackTrace.fromRuntime(thread, this.event.stackTrace) : undefined,
+    this.event.stackTrace ? StackTrace.fromRuntime(thread, this.event.stackTrace) : undefined
   );
 
   constructor(protected readonly event: T) {}
@@ -119,7 +117,7 @@ export abstract class TextualMessage<T extends { stackTrace?: Cdp.Runtime.StackT
       includeStackInVariables ? this.stackTrace(thread) : undefined,
     );
 
-    return { output: '', variablesReference: outputVar.id };
+    return { output, variablesReference: outputVar.id };
   }
 }
 
@@ -129,7 +127,7 @@ export class AssertMessage extends TextualMessage<Cdp.Runtime.ConsoleAPICalledEv
    */
   public async toDap(thread: Thread): Promise<Dap.OutputEventParams> {
     if (this.event.args[0]?.value === 'console.assert') {
-      this.event.args[0].value = localize('console.assert', 'Assertion failed');
+      this.event.args[0].value = l10n.t('Assertion failed');
     }
 
     return {

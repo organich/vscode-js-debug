@@ -2,57 +2,53 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-const del = require('del');
-const filter = require('gulp-filter');
 const gulp = require('gulp');
-const minimist = require('minimist');
-const nls = require('vscode-nls-dev');
+const glob = require('glob');
 const path = require('path');
-const sourcemaps = require('gulp-sourcemaps');
-const tsb = require('gulp-tsb');
 const rename = require('gulp-rename');
 const merge = require('merge2');
 const vsce = require('vsce');
-const webpack = require('webpack');
 const execSync = require('child_process').execSync;
 const fs = require('fs');
 const cp = require('child_process');
 const util = require('util');
-const deepmerge = require('deepmerge');
-const unzipper = require('unzipper');
-const signale = require('signale');
-const streamBuffers = require('stream-buffers');
+const esbuild = require('esbuild');
+const esbuildPlugins = require('./src/build/esbuildPlugins');
 const got = require('got').default;
-const execa = require('execa');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const jszip = require('jszip');
+const stream = require('stream');
+
+const pipelineAsync = util.promisify(stream.pipeline);
 
 const dirname = 'js-debug';
-const translationProjectName = 'vscode-extensions';
-const translationExtensionName = 'js-debug';
-
 const sources = ['src/**/*.{ts,tsx}'];
+const externalModules = ['@vscode/dwarf-debugging'];
 const allPackages = [];
 
-const buildDir = 'out';
+const srcDir = 'src';
+const buildDir = 'dist';
 const buildSrcDir = `${buildDir}/src`;
-const distDir = 'dist';
-const distSrcDir = `${distDir}/src`;
 const nodeTargetsDir = `targets/node`;
+
+const isWatch = process.argv.includes('watch') || process.argv.includes('--watch');
+const isDebug = process.argv.includes('--debug');
 
 /**
  * Whether we're running a nightly build.
  */
-const isNightly = process.argv.includes('--nightly') || process.argv.includes('watch');
+const isNightly = process.argv.includes('--nightly') || isWatch;
 
 /**
  * Extension ID to build. Appended with '-nightly' as necessary.
  */
 const extensionName = isNightly ? 'js-debug-nightly' : 'js-debug';
 
-function runBuildScript(name) {
+async function runBuildScript(name) {
   return new Promise((resolve, reject) =>
     cp.execFile(
       process.execPath,
-      [path.join(__dirname, 'out', 'src', 'build', name)],
+      [path.join(__dirname, buildDir, 'src', 'build', name)],
       (err, stdout, stderr) => {
         process.stderr.write(stderr);
         if (err) {
@@ -66,7 +62,7 @@ function runBuildScript(name) {
           resolve(outstr);
         }
       },
-    ),
+    )
   );
 }
 
@@ -78,27 +74,16 @@ async function readJson(file) {
   return JSON.parse(contents);
 }
 
-const tsProject = tsb.create('./tsconfig.json');
+const del = async patterns => {
+  const files = glob.sync(patterns, { cwd: __dirname });
+  await Promise.all(
+    files.map(f => fs.promises.rm(path.join(__dirname, f), { force: true, recursive: true })),
+  );
+};
 
 gulp.task('clean-assertions', () => del(['src/test/**/*.txt.actual']));
 
-gulp.task('clean', () =>
-  del(['out/**', 'dist/**', 'src/*/package.nls.*.json', 'packages/**', '*.vsix']),
-);
-
-gulp.task('compile:ts', () =>
-  tsProject
-    .src()
-    .pipe(sourcemaps.init())
-    .pipe(tsProject())
-    .pipe(
-      sourcemaps.write('.', {
-        includeContent: false,
-        sourceRoot: '../../src',
-      }),
-    )
-    .pipe(gulp.dest(buildSrcDir)),
-);
+gulp.task('clean', () => del(['dist/**', 'src/*/package.nls.*.json', 'packages/**', '*.vsix']));
 
 async function fixNightlyReadme() {
   const readmePath = `${buildDir}/README.md`;
@@ -121,19 +106,51 @@ const getVersionNumber = () => {
     date.getFullYear(),
     // MM,
     date.getMonth() + 1,
-    //DDHH
+    // DDHH
     `${date.getDate()}${String(date.getHours()).padStart(2, '0')}`,
   ].join('.');
 };
 
+const cachedBuilds = new Map();
+const incrementalEsbuild = async (/** @type {esbuild.BuildOptions} */ options) => {
+  const key = JSON.stringify(options);
+  if (cachedBuilds.has(key)) {
+    return cachedBuilds.get(key).rebuild();
+  }
+
+  if (!isWatch) {
+    const r = await esbuild.build(options);
+    if (r.metafile) {
+      console.log(await esbuild.analyzeMetafile(r.metafile));
+    }
+    return;
+  }
+
+  const ctx = await esbuild.context(options);
+  cachedBuilds.set(key, ctx);
+
+  await ctx.rebuild();
+};
+
+gulp.task('compile:build-scripts', async () =>
+  incrementalEsbuild({
+    entryPoints: fs
+      .readdirSync('src/build')
+      .filter(f => f.endsWith('.ts'))
+      .map(f => `src/build/${f}`),
+    outdir: `${buildDir}/src/build`,
+    define: await getConstantDefines(),
+    bundle: true,
+    platform: 'node',
+  }));
+
 gulp.task('compile:dynamic', async () => {
-  const [contributions, strings] = await Promise.all([
+  const [contributions] = await Promise.all([
     runBuildScript('generate-contributions'),
-    runBuildScript('generate-strings'),
     runBuildScript('documentReadme'),
   ]);
 
-  let packageJson = await readJson(`${buildDir}/package.json`);
+  let packageJson = await readJson('package.json');
   packageJson.name = extensionName;
   if (isNightly) {
     packageJson.displayName += ' (Nightly)';
@@ -142,169 +159,184 @@ gulp.task('compile:dynamic', async () => {
     await fixNightlyReadme();
   }
 
-  packageJson = deepmerge(packageJson, contributions);
+  packageJson = Object.assign(packageJson, contributions);
 
-  return Promise.all([
-    writeFile(`${buildDir}/package.json`, JSON.stringify(packageJson, null, 2)),
-    writeFile(`${buildDir}/package.nls.json`, JSON.stringify(strings, null, 2)),
-  ]);
+  await writeFile(`${buildDir}/package.json`, JSON.stringify(packageJson));
 });
 
 gulp.task('compile:static', () =>
   merge(
-    gulp.src(['LICENSE', 'package.json']),
-    gulp.src(['resources/**/*', 'README.md', 'src/**/*.sh'], { base: '.' }),
-  ).pipe(gulp.dest(buildDir)),
-);
+    gulp.src(
+      [
+        'LICENSE',
+        'resources/**/*',
+        'README.md',
+        'package.nls.json',
+        'src/**/*.sh',
+        'src/ui/basic-wat.tmLanguage.json',
+        '.vscodeignore',
+      ],
+      {
+        base: '.',
+      },
+    ),
+    gulp.src(['node_modules/@c4312/chromehash/pkg/*.wasm']).pipe(rename({ dirname: 'src' })),
+  ).pipe(gulp.dest(buildDir)));
 
-/** Compiles supporting libraries to single bundles in the output */
-gulp.task(
-  'compile:webpack-supporting',
-  gulp.parallel(
-    () => runWebpack({ devtool: 'source-map', compileInPlace: true }),
-    () =>
-      gulp
-        .src('node_modules/@c4312/chromehash/pkg/*.wasm')
-        .pipe(gulp.dest(`${buildSrcDir}/common/hash`)),
-  ),
-);
+const resolveDefaultExts = ['.tsx', '.ts', '.jsx', '.js', '.css', '.json'];
 
-gulp.task(
-  'compile',
-  gulp.series('compile:ts', 'compile:static', 'compile:dynamic', 'compile:webpack-supporting'),
-);
+async function getConstantDefines() {
+  const packageJson = await readJson('package.json');
+  return {
+    EXTENSION_NAME: JSON.stringify(extensionName),
+    EXTENSION_VERSION: JSON.stringify(isNightly ? getVersionNumber() : packageJson.version),
+    EXTENSION_PUBLISHER: JSON.stringify(packageJson.publisher),
+  };
+}
 
-async function runWebpack({
+function compileVendorLibrary(name) {
+  return {
+    name,
+    entryPoints: [require.resolve(name)],
+    outdir: `${buildSrcDir}/vendor`,
+    entryNames: `${name}`,
+  };
+}
+
+async function compileTs({
   packages = [],
-  devtool = false,
+  sourcemap = false,
   compileInPlace = false,
-  mode = process.argv.includes('watch') ? 'development' : 'production',
+  minify = isWatch ? false : true,
   watch = false,
 } = options) {
+  const vendorPrefix = 'vendor';
+
+  // don't watch these, they won't really change:
+  const vendors = new Map(
+    await Promise.all(
+      [
+        {
+          ...compileVendorLibrary('acorn-loose'),
+          plugins: [esbuildPlugins.hackyVendorBundle(new Map([['acorn', './acorn']]))],
+        },
+        compileVendorLibrary('acorn'),
+      ].map(async ({ name, ...opts }) => {
+        await esbuild.build({
+          ...opts,
+          sourcemap,
+          bundle: true,
+          platform: 'node',
+          format: 'cjs',
+          target: 'node20',
+          minify,
+        });
+
+        return [name, `./${vendorPrefix}/${name}.js`];
+      }),
+    ),
+  );
+
   // add the entrypoints common to both vscode and vs here
   packages = [
     ...packages,
-    { entry: `${buildSrcDir}/common/hash/hash.js`, library: false },
-    { entry: `${buildSrcDir}/${nodeTargetsDir}/bootloader.js`, library: false },
-    { entry: `${buildSrcDir}/${nodeTargetsDir}/watchdog.js`, library: false },
-    { entry: `${buildSrcDir}/diagnosticTool/diagnosticTool.js`, library: false, target: 'web' },
+    { entry: `${srcDir}/common/hash/hash.ts`, library: false },
+    { entry: `${srcDir}/common/sourceMaps/renameWorker.ts`, library: false },
+    { entry: `${srcDir}/targets/node/bootloader.ts`, library: false, target: 'node10' },
+    { entry: `${srcDir}/targets/node/watchdog.ts`, library: false, target: 'node10' },
+    {
+      entry: `${srcDir}/diagnosticTool/diagnosticTool.tsx`,
+      library: false,
+      target: 'chrome102',
+      platform: 'browser',
+    },
   ];
 
+  const define = await getConstantDefines();
+
   let todo = [];
-  for (const { entry, target, library, filename } of packages) {
-    const config = {
-      mode,
-      target: target || 'async-node',
-      entry: path.resolve(entry),
-      output: {
-        path: compileInPlace ? path.resolve(path.dirname(entry)) : path.resolve(distSrcDir),
-        filename: filename || path.basename(entry).replace('.js', '.bundle.js'),
-        devtoolModuleFilenameTemplate: '../[resource-path]',
-      },
-      devtool: devtool,
-      resolve: {
-        extensions: ['.js', '.json'],
-        alias: {
-          // their .mjs seems broken:
-          acorn: require.resolve('acorn'),
-          'acorn-loose': require.resolve('acorn-loose'),
-        },
-        fallback: { path: require.resolve('path-browserify') },
-      },
-      module: {
-        rules: [
-          {
-            loader: 'vscode-nls-dev/lib/webpack-loader',
-            options: {
-              base: path.join(__dirname, 'out/src'),
-            },
-          },
-          {
-            test: '\\.node$', // will be regex'd in the webpackBuild script
-            loader: 'node-loader',
-          },
-          {
-            test: '\\.css$', // will be regex'd in the webpackBuild script
-            use: ['style-loader', 'css-loader'],
-          },
-        ],
-      },
-      plugins: [],
-      node: {
-        __dirname: false,
-        __filename: false,
-      },
-      externals: {
-        vscode: 'commonjs vscode',
-      },
-    };
-
-    if (library) {
-      config.output.libraryTarget = 'commonjs2';
-    }
-
+  for (
+    const {
+      entry,
+      platform = 'node',
+      library,
+      isInVsCode,
+      nodePackages,
+      target = 'node20',
+    } of packages
+  ) {
     todo.push(
-      execa('node', [path.join(__dirname, 'src/build/webpackBuild')], {
-        stdio: 'inherit',
-        env: {
-          ...process.env,
-          CONFIG: JSON.stringify(config),
-          ANALYZE_SIZE: String(process.argv.includes('--analyze-size')),
-          WATCH: String(watch),
-        },
+      incrementalEsbuild({
+        entryPoints: [entry],
+        platform,
+        bundle: true,
+        outdir: buildSrcDir,
+        resolveExtensions: isInVsCode
+          ? ['.extensionOnly.ts', ...resolveDefaultExts]
+          : resolveDefaultExts,
+        external: isInVsCode ? ['vscode', ...externalModules] : externalModules,
+        sourcemap: !!sourcemap,
+        sourcesContent: false,
+        packages: nodePackages,
+        minify,
+        define,
+        target,
+        alias: platform === 'node' ? {} : { path: 'path-browserify' },
+        plugins: [
+          esbuildPlugins.nativeNodeModulesPlugin(),
+          esbuildPlugins.importGlobLazy(),
+          esbuildPlugins.dirname(/src.test./),
+          esbuildPlugins.hackyVendorBundle(vendors),
+        ],
+        format: library ? 'cjs' : 'iife',
       }),
     );
   }
 
   await Promise.all(todo);
+
+  await fs.promises.appendFile(
+    path.resolve(buildSrcDir, 'bootloader.js'),
+    '\n//# sourceURL=bootloader.bundle.cdp',
+  );
 }
 
 /** Run webpack to bundle the extension output files */
-gulp.task('package:webpack-bundle', async () => {
+gulp.task('compile:extension', async () => {
   const packages = [
-    { entry: `${buildSrcDir}/extension.js`, filename: 'extension.js', library: true },
+    { entry: `${srcDir}/extension.ts`, library: true, isInVsCode: true },
+    {
+      entry: `${srcDir}/test/testRunner.ts`,
+      library: true,
+      isInVsCode: true,
+      nodePackages: 'external',
+    },
   ];
-  return runWebpack({ packages });
+  return compileTs({ packages, sourcemap: true });
 });
+
+gulp.task(
+  'compile',
+  gulp.series('compile:static', 'compile:build-scripts', 'compile:dynamic', 'compile:extension'),
+);
 
 /** Run webpack to bundle into the flat session launcher (for VS or standalone debug server)  */
 gulp.task('flatSessionBundle:webpack-bundle', async () => {
-  const packages = [{ entry: `${buildSrcDir}/flatSessionLauncher.js`, library: true }];
-  return runWebpack({ packages, devtool: 'nosources-source-map' });
+  const packages = [{ entry: `${srcDir}/flatSessionLauncher.ts`, library: true }];
+  return compileTs({ packages, sourcemap: isWatch });
 });
 
-gulp.task('package:bootloader-as-cdp', done => {
-  const bootloaderFilePath = path.resolve(distSrcDir, 'bootloader.bundle.js');
-  fs.appendFile(bootloaderFilePath, '\n//# sourceURL=bootloader.bundle.cdp', done);
+/** Run webpack to bundle into the standard DAP debug server */
+gulp.task('dapDebugServer:webpack-bundle', async () => {
+  const packages = [{ entry: `${srcDir}/dapDebugServer.ts`, library: false }];
+  return compileTs({ packages, sourcemap: isWatch });
 });
 
 /** Run webpack to bundle into the VS debug server */
 gulp.task('vsDebugServerBundle:webpack-bundle', async () => {
-  const packages = [{ entry: `${buildSrcDir}/vsDebugServer.js`, library: true }];
-  return runWebpack({ packages, devtool: 'nosources-source-map' });
+  const packages = [{ entry: `${srcDir}/vsDebugServer.ts`, library: true }];
+  return compileTs({ packages, sourcemap: isDebug, minify: !isDebug });
 });
-
-/** Copy the extension static files */
-gulp.task('package:copy-extension-files', () =>
-  merge(
-    gulp.src(
-      [
-        `${buildDir}/LICENSE`,
-        `${buildDir}/package.json`,
-        `${buildDir}/package.*.json`,
-        `${buildDir}/resources/**/*`,
-        `${buildDir}/README.md`,
-      ],
-      {
-        base: buildDir,
-      },
-    ),
-    gulp
-      .src(['node_modules/source-map/lib/*.wasm', 'node_modules/@c4312/chromehash/pkg/*.wasm'])
-      .pipe(rename({ dirname: 'src' })),
-    gulp.src(`${buildDir}/src/**/*.sh`).pipe(rename({ dirname: 'src' })),
-  ).pipe(gulp.dest(distDir)),
-);
 
 const vsceUrls = {
   baseContentUrl: 'https://github.com/microsoft/vscode-js-debug/blob/main',
@@ -315,108 +347,82 @@ const vsceUrls = {
 gulp.task('package:createVSIX', () =>
   vsce.createVSIX({
     ...vsceUrls,
-    cwd: distDir,
-    useYarn: true,
-    packagePath: path.join(distDir, `${extensionName}.vsix`),
-  }),
-);
+    cwd: buildDir,
+    dependencies: false,
+    packagePath: path.join(buildDir, `${extensionName}.vsix`),
+  }));
 
-gulp.task('nls:bundle-download', async () => {
-  const res = await got.stream('https://github.com/microsoft/vscode-loc/archive/main.zip');
-  await new Promise((resolve, reject) =>
-    res
-      .pipe(unzipper.Parse())
-      .on('entry', entry => {
-        const match = /vscode-language-pack-(.*?)\/.+ms-vscode\.js-debug.*?\.i18n\.json$/.exec(
-          entry.path,
-        );
-        if (!match) {
-          return entry.autodrain();
-        }
+gulp.task('l10n:bundle-download', async () => {
+  const opts = {};
+  const proxy = process.env.https_proxy || process.env.HTTPS_PROXY || null;
+  if (proxy) {
+    opts.agent = {
+      https: new HttpsProxyAgent(proxy),
+    };
+  }
 
-        const buffer = new streamBuffers.WritableStreamBuffer();
-        const locale = match[1];
-        entry.pipe(buffer).on('finish', () => {
-          try {
-            const strings = JSON.parse(buffer.getContentsAsString('utf-8'));
-            fs.writeFileSync(
-              path.join(distDir, `nls.bundle.${locale}.json`),
-              JSON.stringify(strings.contents),
-            );
-            signale.info(`Added strings for ${locale}`);
-          } catch (e) {
-            reject(`Error parsing ${entry.path}: ${e}`);
-          }
-        });
-      })
-      .on('end', resolve)
-      .on('error', reject)
-      .resume(),
-  );
+  const res = await got('https://github.com/microsoft/vscode-loc/archive/main.zip', opts).buffer();
+  const content = await jszip.loadAsync(res);
+
+  for (const fileName of Object.keys(content.files)) {
+    const match = /vscode-language-pack-(.*?)\/.+ms-vscode\.js-debug.*?\.i18n\.json$/.exec(
+      fileName,
+    );
+    if (match) {
+      const locale = match[1];
+      const file = content.files[fileName];
+      const extractPath = path.join(buildDir, `nls.bundle.${locale}.json`);
+      await pipelineAsync(file.nodeStream(), fs.createWriteStream(extractPath));
+    }
+  }
 });
-
-gulp.task('nls:bundle-create', () =>
-  gulp
-    .src(sources, { base: __dirname })
-    .pipe(nls.createMetaDataFiles())
-    .pipe(nls.bundleMetaDataFiles(`ms-vscode.${extensionName}`, ''))
-    .pipe(nls.bundleLanguageFiles())
-    .pipe(filter('**/nls.*.json'))
-    .pipe(gulp.dest('dist')),
-);
-
-gulp.task(
-  'translations-export',
-  gulp.series('clean', 'compile', 'nls:bundle-create', () =>
-    gulp
-      .src(['out/package.json', 'out/nls.metadata.header.json', 'out/nls.metadata.json'])
-      .pipe(nls.createXlfFiles(translationProjectName, translationExtensionName))
-      .pipe(gulp.dest(`../vscode-translations-export`)),
-  ),
-);
 
 /** Clean, compile, bundle, and create vsix for the extension */
 gulp.task(
   'package:prepare',
   gulp.series(
     'clean',
-    'compile:ts',
     'compile:static',
+    'compile:build-scripts',
     'compile:dynamic',
-    'package:webpack-bundle',
-    'package:bootloader-as-cdp',
-    'package:copy-extension-files',
-    'nls:bundle-create',
+    'compile:extension',
     'package:createVSIX',
   ),
 );
 
-gulp.task('package', gulp.series('package:prepare', 'package:createVSIX'));
-
+/** Prepares the package and then hoists it to the root directory. Destructive. */
 gulp.task(
-  'flatSessionBundle',
-  gulp.series(
-    'clean',
-    'compile',
-    'flatSessionBundle:webpack-bundle',
-    'package:bootloader-as-cdp',
-    'package:copy-extension-files',
-    gulp.parallel('nls:bundle-download', 'nls:bundle-create'),
-  ),
+  'package:hoist',
+  gulp.series('package:prepare', async () => {
+    const srcFiles = await fs.promises.readdir(buildDir);
+    const ignoredFiles = new Set(await fs.promises.readdir(__dirname));
+
+    ignoredFiles.delete('l10n-extract'); // special case: made in the pipeline
+
+    for (const file of srcFiles) {
+      ignoredFiles.delete(file);
+      await fs.promises.rm(path.join(__dirname, file), { force: true, recursive: true });
+      await fs.promises.rename(path.join(buildDir, file), path.join(__dirname, file));
+    }
+    await fs.promises.appendFile(
+      path.join(__dirname, '.vscodeignore'),
+      [...ignoredFiles].join('\n'),
+    );
+  }),
 );
 
-// for now, this task will build both flat session and debug server until we no longer need flat session
+gulp.task('package', gulp.series('package:prepare', 'package:createVSIX'));
+
+gulp.task('flatSessionBundle', gulp.series('clean', 'compile', 'flatSessionBundle:webpack-bundle'));
+
+gulp.task(
+  'dapDebugServer',
+  gulp.series('clean', 'compile:static', 'dapDebugServer:webpack-bundle'),
+);
+
 gulp.task(
   'vsDebugServerBundle',
-  gulp.series(
-    'clean',
-    'compile',
-    'vsDebugServerBundle:webpack-bundle',
-    'flatSessionBundle:webpack-bundle',
-    'package:bootloader-as-cdp',
-    'package:copy-extension-files',
-    gulp.parallel('nls:bundle-download', 'nls:bundle-create'),
-  ),
+  gulp.series('clean', 'compile', 'vsDebugServerBundle:webpack-bundle', 'l10n:bundle-download'),
 );
 
 /** Publishes the build extension to the marketplace */
@@ -425,10 +431,9 @@ gulp.task('publish:vsce', () =>
     ...vsceUrls,
     noVerify: true, // for proposed API usage
     pat: process.env.MARKETPLACE_TOKEN,
-    useYarn: true,
-    cwd: distDir,
-  }),
-);
+    dependencies: false,
+    cwd: buildDir,
+  }));
 
 gulp.task('publish', gulp.series('package', 'publish:vsce'));
 gulp.task('default', gulp.series('compile'));
@@ -436,23 +441,17 @@ gulp.task('default', gulp.series('compile'));
 gulp.task(
   'watch',
   gulp.series('clean', 'compile', done => {
-    gulp.watch(
-      [...sources, '*.json'],
-      gulp.series('compile:ts', 'compile:static', 'compile:dynamic'),
-    );
-    runWebpack({ watch: true, devtool: 'source-map', compileInPlace: true });
+    gulp.watch([...sources, '*.json'], gulp.series('compile'));
     done();
   }),
 );
 
-const runPrettier = (onlyStaged, fix, callback) => {
-  const child = cp.fork(
-    './node_modules/@mixer/parallel-prettier/dist/index.js',
-    [fix ? '--write' : '--list-different', 'src/**/*.{ts,tsx}', '!src/**/*.d.ts', '*.md'],
-    { stdio: 'inherit' },
-  );
+const runFormatting = (onlyStaged, fix, callback) => {
+  const child = cp.fork('./node_modules/dprint/bin.js', [fix ? 'fmt' : 'check'], {
+    stdio: 'inherit',
+  });
 
-  child.on('exit', code => (code ? callback(`Prettier exited with code ${code}`) : callback()));
+  child.on('exit', code => (code ? callback(`Formatter exited with code ${code}`) : callback()));
 };
 
 const runEslint = (fix, callback) => {
@@ -465,13 +464,13 @@ const runEslint = (fix, callback) => {
   child.on('exit', code => (code ? callback(`Eslint exited with code ${code}`) : callback()));
 };
 
-gulp.task('format:prettier', callback => runPrettier(false, true, callback));
+gulp.task('format:code', callback => runFormatting(false, true, callback));
 gulp.task('format:eslint', callback => runEslint(true, callback));
-gulp.task('format', gulp.series('format:prettier', 'format:eslint'));
+gulp.task('format', gulp.series('format:code', 'format:eslint'));
 
-gulp.task('lint:prettier', callback => runPrettier(false, false, callback));
+gulp.task('lint:code', callback => runFormatting(false, false, callback));
 gulp.task('lint:eslint', callback => runEslint(false, callback));
-gulp.task('lint', gulp.parallel('lint:prettier', 'lint:eslint'));
+gulp.task('lint', gulp.parallel('lint:code', 'lint:eslint'));
 
 /**
  * Run a command in the terminal using exec, and wrap it in a promise

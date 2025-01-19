@@ -1,9 +1,9 @@
 /*---------------------------------------------------------
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
+import * as l10n from '@vscode/l10n';
 import { Container } from 'inversify';
 import * as vscode from 'vscode';
-import * as nls from 'vscode-nls';
 import { IPortLeaseTracker } from '../adapter/portLeaseTracker';
 import { Commands, Configuration, readConfig, registerCommand } from '../common/contributionUtils';
 import { ProxyLogger } from '../common/logging/proxyLogger';
@@ -18,22 +18,21 @@ import { noPackageJsonProvider } from '../targets/node/packageJsonProvider';
 import { NodeOnlyPathResolverFactory } from '../targets/sourcePathResolverFactory';
 import { launchVirtualTerminalParent } from './debugTerminalUI';
 
-const localize = nls.loadMessageBundle();
-
 export function registerAutoAttach(
   context: vscode.ExtensionContext,
   delegate: DelegateLauncherFactory,
   services: Container,
 ) {
-  let launcher: Promise<AutoAttachLauncher> | undefined;
+  const launchers = new Map<vscode.WorkspaceFolder | undefined, Promise<AutoAttachLauncher>>();
   let disposeTimeout: NodeJS.Timeout | undefined;
 
-  const acquireLauncher = () => {
-    if (launcher) {
-      return launcher;
+  const acquireLauncher = (workspaceFolder: vscode.WorkspaceFolder | undefined) => {
+    const prev = launchers.get(workspaceFolder);
+    if (prev) {
+      return prev;
     }
 
-    launcher = (async () => {
+    const launcher = (async () => {
       const logger = new ProxyLogger();
       // TODO: Figure out how to inject FsUtils
       const inst = new AutoAttachLauncher(
@@ -45,16 +44,18 @@ export function registerAutoAttach(
         services.get(IPortLeaseTracker),
       );
 
-      await launchVirtualTerminalParent(
-        delegate,
-        inst,
-        readConfig(vscode.workspace, Configuration.TerminalDebugConfig),
-      );
+      let config = readConfig(vscode.workspace, Configuration.TerminalDebugConfig);
+      if (workspaceFolder) {
+        const fsPath = workspaceFolder?.uri.fsPath;
+        config = { ...config, cwd: fsPath, __workspaceFolder: fsPath };
+      }
+
+      await launchVirtualTerminalParent(delegate, inst, config);
 
       inst.onTargetListChanged(() => {
         if (inst.targetList().length === 0 && !disposeTimeout) {
           disposeTimeout = setTimeout(() => {
-            launcher = undefined;
+            launchers.delete(workspaceFolder);
             inst.terminate();
           }, 5 * 60 * 1000);
         } else if (disposeTimeout) {
@@ -66,17 +67,19 @@ export function registerAutoAttach(
       return inst;
     })();
 
+    launchers.set(workspaceFolder, launcher);
+
     return launcher;
   };
 
   context.subscriptions.push(
     registerCommand(vscode.commands, Commands.AutoAttachSetVariables, async () => {
       try {
-        const launcher = await acquireLauncher();
+        const launcher = await acquireLauncher(vscode.workspace.workspaceFolders?.[0]);
         return { ipcAddress: launcher.deferredSocketName as string };
       } catch (e) {
         if (e instanceof AutoAttachPreconditionFailed && e.helpLink) {
-          const details = localize('details', 'Details');
+          const details = l10n.t('Details');
           if ((await vscode.window.showErrorMessage(e.message, details)) === details) {
             vscode.env.openExternal(vscode.Uri.parse(e.helpLink));
           }
@@ -85,25 +88,23 @@ export function registerAutoAttach(
         }
       }
     }),
-    vscode.workspace.onDidChangeWorkspaceFolders(() => {
-      launcher?.then(l => l.refreshVariables());
-    }),
     registerCommand(vscode.commands, Commands.AutoAttachToProcess, async info => {
       try {
-        const launcher = await acquireLauncher();
+        const wf = info.scriptName
+          && vscode.workspace.getWorkspaceFolder(vscode.Uri.file(info.scriptName));
+        const launcher = await acquireLauncher(wf || vscode.workspace.workspaceFolders?.[0]);
         launcher.spawnForChild(info);
       } catch (err) {
         console.error(err);
         vscode.window.showErrorMessage(`Error activating auto attach: ${err.stack || err}`);
       }
     }),
-    registerCommand(vscode.commands, Commands.AutoAttachClearVariables, async () => {
+    registerCommand(vscode.commands, Commands.AutoAttachClearVariables, () => {
       AutoAttachLauncher.clearVariables(context);
 
-      const inst = await launcher;
-      if (inst) {
-        inst.terminate();
-        launcher = undefined;
+      for (const [key, value] of launchers.entries()) {
+        launchers.delete(key);
+        value.then(v => v.terminate());
       }
     }),
   );

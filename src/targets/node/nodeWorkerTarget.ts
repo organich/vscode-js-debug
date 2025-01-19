@@ -71,7 +71,12 @@ export class NodeWorkerTarget implements ITarget {
   }
 
   public async attach(): Promise<Cdp.Api | undefined> {
-    await Promise.all([this.cdp.Debugger.enable({}), this.cdp.Runtime.enable({})]);
+    // order matters! The runtime must be enabled first so we know what
+    // execution contexts scripts are in
+    await this.cdp.Runtime.enable({});
+    if (!this.launchConfig.noDebug) {
+      await this.cdp.Debugger.enable({});
+    }
     this.attached = true;
     return this.cdp;
   }
@@ -113,10 +118,14 @@ export class NodeWorkerTarget implements ITarget {
     return false;
   }
 
+  supportsXHRBreakpoints(): boolean {
+    return false;
+  }
+
   scriptUrlToUrl(url: string): string {
     // copied from NodeTarget. Todo: should be merged into the path resolver logic
-    const isPath =
-      url[0] === '/' || (process.platform === 'win32' && url[1] === ':' && url[2] === '\\');
+    const isPath = url[0] === '/'
+      || (process.platform === 'win32' && url[1] === ':' && url[2] === '\\');
     return isPath ? absolutePathToFileUrl(url) : url;
   }
 

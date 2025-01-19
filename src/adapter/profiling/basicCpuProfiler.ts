@@ -2,9 +2,9 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { inject, injectable } from 'inversify';
-import * as nls from 'vscode-nls';
-import { IProfile, IProfiler, StartProfileParams } from '.';
+import { isAbsolute, join } from 'path';
 import Cdp from '../../cdp/api';
 import { ICdpApi } from '../../cdp/connection';
 import { EventEmitter } from '../../common/events';
@@ -12,10 +12,9 @@ import { AnyLaunchConfiguration } from '../../configuration';
 import { profileCaptureError } from '../../dap/errors';
 import { ProtocolError } from '../../dap/protocolError';
 import { FS, FsPromises } from '../../ioc-extras';
-import { SourceContainer } from '../sources';
+import { SourceContainer } from '../sourceContainer';
+import { IProfile, IProfiler, StartProfileParams } from '.';
 import { SourceAnnotationHelper } from './sourceAnnotationHelper';
-
-const localize = nls.loadMessageBundle();
 
 export interface IBasicProfileParams {
   precise: boolean;
@@ -29,10 +28,9 @@ export interface IBasicProfileParams {
 export class BasicCpuProfiler implements IProfiler<IBasicProfileParams> {
   public static readonly type = 'cpu';
   public static readonly extension = '.cpuprofile';
-  public static readonly label = localize('profile.cpu.label', 'CPU Profile');
-  public static readonly description = localize(
-    'profile.cpu.description',
-    'Generates a .cpuprofile file you can open in the Chrome devtools',
+  public static readonly label = l10n.t('CPU Profile');
+  public static readonly description = l10n.t(
+    'Generates a .cpuprofile file you can open in VS Code or the Edge/Chrome devtools',
   );
   public static readonly editable = true;
 
@@ -51,8 +49,6 @@ export class BasicCpuProfiler implements IProfiler<IBasicProfileParams> {
    * @inheritdoc
    */
   public async start(_options: StartProfileParams<IBasicProfileParams>, file: string) {
-    await this.cdp.Profiler.enable({});
-
     if (!(await this.cdp.Profiler.start({}))) {
       throw new ProtocolError(profileCaptureError());
     }
@@ -64,6 +60,23 @@ export class BasicCpuProfiler implements IProfiler<IBasicProfileParams> {
       this.launchConfig.__workspaceFolder,
       file,
     );
+  }
+
+  /**
+   * Annotates and saves the profile to the file path. If the file path is
+   * not absolute, then it will be saved in the workspace folder.
+   */
+  public async save(profile: Cdp.Profiler.Profile, file: string) {
+    const annotated = await annotateSources(
+      profile,
+      this.sources,
+      this.launchConfig.__workspaceFolder,
+    );
+    if (!isAbsolute(file)) {
+      file = join(this.launchConfig.__workspaceFolder, file);
+    }
+
+    await this.fs.writeFile(file, JSON.stringify(annotated));
   }
 }
 
@@ -95,7 +108,6 @@ class BasicProfile implements IProfile {
   public async dispose() {
     if (!this.disposed) {
       this.disposed = true;
-      await this.cdp.Profiler.disable({});
       this.stopEmitter.fire();
     }
   }
@@ -111,43 +123,47 @@ class BasicProfile implements IProfile {
 
     await this.dispose();
 
-    const annotated = await this.annotateSources(result.profile);
+    const annotated = await annotateSources(result.profile, this.sources, this.workspaceFolder);
     await this.fs.writeFile(this.file, JSON.stringify(annotated));
   }
+}
 
-  /**
-   * Adds source locations
-   */
-  private async annotateSources(profile: Cdp.Profiler.Profile) {
-    const helper = new SourceAnnotationHelper(this.sources);
-    const nodes = profile.nodes.map(node => ({
-      ...node,
-      locationId: helper.getLocationIdFor(node.callFrame),
-      positionTicks: node.positionTicks?.map(tick => ({
-        ...tick,
-        // weirdly, line numbers here are 1-based, not 0-based. The position tick
-        // only gives line-level granularity, so 'mark' the entire range of source
-        // code the tick refers to
-        startLocationId: helper.getLocationIdFor({
-          ...node.callFrame,
-          lineNumber: tick.line - 1,
-          columnNumber: 0,
-        }),
-        endLocationId: helper.getLocationIdFor({
-          ...node.callFrame,
-          lineNumber: tick.line,
-          columnNumber: 0,
-        }),
-      })),
-    }));
+/**
+ * Adds source locations
+ */
+async function annotateSources(
+  profile: Cdp.Profiler.Profile,
+  sources: SourceContainer,
+  workspaceFolder: string,
+) {
+  const helper = new SourceAnnotationHelper(sources);
+  const nodes = profile.nodes.map(node => ({
+    ...node,
+    locationId: helper.getLocationIdFor(node.callFrame),
+    positionTicks: node.positionTicks?.map(tick => ({
+      ...tick,
+      // weirdly, line numbers here are 1-based, not 0-based. The position tick
+      // only gives line-level granularity, so 'mark' the entire range of source
+      // code the tick refers to
+      startLocationId: helper.getLocationIdFor({
+        ...node.callFrame,
+        lineNumber: tick.line - 1,
+        columnNumber: 0,
+      }),
+      endLocationId: helper.getLocationIdFor({
+        ...node.callFrame,
+        lineNumber: tick.line,
+        columnNumber: 0,
+      }),
+    })),
+  }));
 
-    return {
-      ...profile,
-      nodes,
-      $vscode: {
-        rootPath: this.workspaceFolder,
-        locations: await helper.getLocations(),
-      },
-    };
-  }
+  return {
+    ...profile,
+    nodes,
+    $vscode: {
+      rootPath: workspaceFolder,
+      locations: await helper.getLocations(),
+    },
+  };
 }

@@ -2,7 +2,7 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-export const truthy = <T>(value: T | null | false | undefined | ''): value is T => !!value;
+export const truthy = <T>(value: T | null | false | undefined | '' | void): value is T => !!value;
 
 export const removeNulls = <V>(obj: { [key: string]: V | null }) =>
   filterValues(obj, (v): v is V => v !== null);
@@ -12,7 +12,7 @@ export const removeUndefined = <V>(obj: { [key: string]: V | undefined }) =>
 
 export const isInstanceOf = <T extends Function>(cls: T) =>
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (obj => obj instanceof cls) as T extends { new (...args: any[]): infer R }
+  (obj => obj instanceof cls) as T extends { new(...args: any[]): infer R }
     ? (obj: unknown) => obj is R
     : never;
 
@@ -280,7 +280,7 @@ export function memoizeWeak<T extends object, R>(fn: (arg: T) => R): (arg: T) =>
  * Debounces the function call for an interval.
  */
 export function debounce(duration: number, fn: () => void): (() => void) & { clear: () => void } {
-  let timeout: NodeJS.Timer | void;
+  let timeout: NodeJS.Timeout | void;
   const debounced = () => {
     if (timeout !== undefined) {
       clearTimeout(timeout);
@@ -310,7 +310,7 @@ export function trailingEdgeThrottle(
   duration: number,
   fn: () => void,
 ): (() => void) & { clear: () => void; queued: () => boolean } {
-  let timeout: NodeJS.Timer | void;
+  let timeout: NodeJS.Timeout | void;
   const debounced = () => {
     if (timeout !== undefined) {
       return;
@@ -338,14 +338,14 @@ export function trailingEdgeThrottle(
  * Bisets the array by the predicate. The first return value will be the ones
  * in which the predicate returned true, the second where it returned false.
  */
-export function bisectArray<T>(
+export async function bisectArrayAsync<T>(
   items: ReadonlyArray<T>,
-  predicate: (item: T) => boolean,
-): [T[], T[]] {
+  predicate: (item: T) => Promise<boolean> | boolean,
+): Promise<[T[], T[]]> {
   const a: T[] = [];
   const b: T[] = [];
   for (const item of items) {
-    if (predicate(item)) {
+    if (await predicate(item)) {
       a.push(item);
     } else {
       b.push(item);

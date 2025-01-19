@@ -2,17 +2,18 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { promises as fs } from 'fs';
 import { inject, injectable } from 'inversify';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CancellationToken } from 'vscode';
-import * as nls from 'vscode-nls';
 import { writeToConsole } from '../../common/console';
 import { DebugType } from '../../common/contributionUtils';
 import { EnvironmentVars } from '../../common/environmentVars';
 import { findOpenPort } from '../../common/findOpenPort';
 import { existsInjected, IFsUtils, LocalFsUtils } from '../../common/fsUtils';
+import { nodeInternalsToken } from '../../common/node15Internal';
 import { forceForwardSlashes, isSubpathOrEqualTo } from '../../common/pathUtils';
 import { some } from '../../common/promiseUtil';
 import { getNormalizedBinaryName, nearestDirectoryWhere } from '../../common/urlUtils';
@@ -30,8 +31,6 @@ import { INvmResolver } from '../../targets/node/nvmResolver';
 import { fixInspectFlags } from '../configurationUtils';
 import { resolveProcessId } from '../processPicker';
 import { BaseConfigurationResolver } from './baseConfigurationResolver';
-
-const localize = nls.loadMessageBundle();
 
 type ResolvingNodeConfiguration =
   | ResolvingNodeAttachConfiguration
@@ -56,16 +55,23 @@ export class NodeConfigurationResolver extends BaseConfigurationResolver<AnyNode
    * @inheritdoc
    */
   public async resolveDebugConfigurationWithSubstitutedVariables(
-    folder: vscode.WorkspaceFolder | undefined,
+    _folder: vscode.WorkspaceFolder | undefined,
     rawConfig: vscode.DebugConfiguration,
   ): Promise<vscode.DebugConfiguration | undefined> {
     const config = rawConfig as AnyNodeConfiguration;
     if (
-      config.type === DebugType.Node &&
-      config.request === 'attach' &&
-      typeof config.processId === 'string'
+      config.type === DebugType.Node
+      && config.request === 'attach'
+      && typeof config.processId === 'string'
     ) {
       await resolveProcessId(this.fsUtils, config);
+    }
+
+    if ('port' in config && typeof config.port === 'string') {
+      config.port = Number(config.port);
+    }
+    if ('attachSimplePort' in config && typeof config.attachSimplePort === 'string') {
+      config.attachSimplePort = Number(config.attachSimplePort);
     }
 
     // check that the cwd is valid to avoid mysterious ENOENTs (vscode#133310)
@@ -73,7 +79,7 @@ export class NodeConfigurationResolver extends BaseConfigurationResolver<AnyNode
       const stats = await existsInjected(fs, config.cwd);
       if (!stats) {
         vscode.window.showErrorMessage(
-          localize('cwd.notFound', 'The configured `cwd` {0} does not exist.', config.cwd),
+          l10n.t('The configured `cwd` {0} does not exist.', config.cwd),
           { modal: true },
         );
         return;
@@ -81,7 +87,7 @@ export class NodeConfigurationResolver extends BaseConfigurationResolver<AnyNode
 
       if (!stats.isDirectory()) {
         vscode.window.showErrorMessage(
-          localize('cwd.notFound', 'The configured `cwd` {0} is not a folder.', config.cwd),
+          l10n.t('The configured `cwd` {0} is not a folder.', config.cwd),
           { modal: true },
         );
         return;
@@ -102,19 +108,17 @@ export class NodeConfigurationResolver extends BaseConfigurationResolver<AnyNode
     if (!config.name && !config.type && !config.request) {
       config = await createLaunchConfigFromContext(folder, true, config);
       if (config.request === 'launch' && !config.program) {
-        vscode.window.showErrorMessage(
-          localize('program.not.found.message', 'Cannot find a program to debug'),
-          { modal: true },
-        );
+        vscode.window.showErrorMessage(l10n.t('Cannot find a program to debug'), {
+          modal: true,
+        });
         return;
       }
     }
 
     // make sure that config has a 'cwd' attribute set
     if (!config.cwd) {
-      config.cwd =
-        config.localRoot || // https://github.com/microsoft/vscode-js-debug/issues/894#issuecomment-745449195
-        guessWorkingDirectory(config.request === 'launch' ? config.program : undefined, folder);
+      config.cwd = config.localRoot // https://github.com/microsoft/vscode-js-debug/issues/894#issuecomment-745449195
+        || guessWorkingDirectory(config.request === 'launch' ? config.program : undefined, folder);
     }
 
     // if a 'remoteRoot' is specified without a corresponding 'localRoot', set 'localRoot' to the workspace folder.
@@ -130,8 +134,8 @@ export class NodeConfigurationResolver extends BaseConfigurationResolver<AnyNode
       // Deno does not support NODE_OPTIONS, so if we see it, try to set the
       // necessary options automatically.
       if (
-        config.runtimeExecutable &&
-        getNormalizedBinaryName(config.runtimeExecutable) === 'deno'
+        config.runtimeExecutable
+        && getNormalizedBinaryName(config.runtimeExecutable) === 'deno'
       ) {
         // If the user manually set up attachSimplePort, do nothing.
         if (!config.attachSimplePort) {
@@ -155,10 +159,9 @@ export class NodeConfigurationResolver extends BaseConfigurationResolver<AnyNode
       if (typeof nvmVersion === 'string' && nvmVersion !== 'default') {
         const { directory, binary } = await this.nvmResolver.resolveNvmVersionPath(nvmVersion);
         config.env = new EnvironmentVars(config.env).addToPath(directory, 'prepend', true).value;
-        config.runtimeExecutable =
-          !config.runtimeExecutable || config.runtimeExecutable === 'node'
-            ? binary
-            : config.runtimeExecutable;
+        config.runtimeExecutable = !config.runtimeExecutable || config.runtimeExecutable === 'node'
+          ? binary
+          : config.runtimeExecutable;
       }
 
       // when using "integratedTerminal" ensure that debug console doesn't get activated; see https://github.com/Microsoft/vscode/issues/43164
@@ -283,7 +286,10 @@ async function guessOutFiles(
 
   const root = await nearestDirectoryWhere(
     programLocation,
-    async p => !p.includes('node_modules') && (await fsUtils.exists(path.join(p, 'package.json'))),
+    async p =>
+      !p.includes('node_modules') && (await fsUtils.exists(path.join(p, 'package.json')))
+        ? p
+        : undefined,
   );
 
   if (root) {
@@ -320,8 +326,8 @@ export async function createLaunchConfigFromContext(
   const config: ResolvingNodeConfiguration = {
     type: DebugType.Node,
     request: 'launch',
-    name: localize('node.launch.config.name', 'Launch Program'),
-    skipFiles: ['<node_internals>/**'],
+    name: l10n.t('Launch Program'),
+    skipFiles: [`${nodeInternalsToken}/**`],
   };
 
   if (existingConfig && existingConfig.noDebug) {
@@ -334,13 +340,7 @@ export async function createLaunchConfigFromContext(
 
   if (pkg && pkg.name === 'mern-starter') {
     if (resolve) {
-      writeToConsole(
-        localize(
-          'mern.starter.explanation',
-          "Launch configuration for '{0}' project created.",
-          'Mern Starter',
-        ),
-      );
+      writeToConsole(l10n.t("Launch configuration for '{0}' project created.", 'Mern Starter'));
     }
     configureMern(config);
     return config;
@@ -350,12 +350,7 @@ export async function createLaunchConfigFromContext(
     // try to find a value for 'program' by analysing package.json
     program = await guessProgramFromPackage(folder, pkg, resolve);
     if (program && resolve) {
-      writeToConsole(
-        localize(
-          'program.guessed.from.package.json.explanation',
-          "Launch configuration created based on 'package.json'.",
-        ),
-      );
+      writeToConsole(l10n.t("Launch configuration created based on 'package.json'."));
     }
   }
 
@@ -380,8 +375,8 @@ export async function createLaunchConfigFromContext(
     program = await some(
       commonEntrypoints.map(
         async file =>
-          (await existsInjected(fs, path.join(basePath, file))) &&
-          '${workspaceFolder}' + path.sep + file,
+          (await existsInjected(fs, path.join(basePath, file)))
+          && '${workspaceFolder}' + path.sep + file,
       ),
     );
   }
@@ -401,13 +396,12 @@ export async function createLaunchConfigFromContext(
 
   // prepare for source maps by adding 'outFiles' if typescript or coffeescript is detected
   if (
-    useSourceMaps ||
-    vscode.workspace.textDocuments.some(document => isTranspiledLanguage(document.languageId))
+    useSourceMaps
+    || vscode.workspace.textDocuments.some(document => isTranspiledLanguage(document.languageId))
   ) {
     if (resolve) {
       writeToConsole(
-        localize(
-          'outFiles.explanation',
+        l10n.t(
           "Adjust glob pattern(s) in the 'outFiles' attribute so that they cover the generated JavaScript.",
         ),
       );
@@ -497,10 +491,10 @@ async function guessProgramFromPackage(
         program = path.join('${workspaceFolder}', program);
       }
       if (
-        resolve &&
-        targetPath &&
-        !(await existsInjected(fs, targetPath)) &&
-        !(await existsInjected(fs, targetPath + '.js'))
+        resolve
+        && targetPath
+        && !(await existsInjected(fs, targetPath))
+        && !(await existsInjected(fs, targetPath + '.js'))
       ) {
         return undefined;
       }

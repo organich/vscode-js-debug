@@ -6,6 +6,8 @@ import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { inject, injectable } from 'inversify';
 import { EnvironmentVars } from '../../common/environmentVars';
 import { ILogger } from '../../common/logging';
+import { formatSubprocessArguments } from '../../common/processUtils';
+import { StreamSplitter } from '../../common/streamSplitter';
 import { INodeLaunchConfiguration, OutputSource } from '../../configuration';
 import Dap from '../../dap/api';
 import { ILaunchContext } from '../targets';
@@ -28,18 +30,22 @@ export class SubprocessProgramLauncher implements IProgramLauncher {
     config: INodeLaunchConfiguration,
     context: ILaunchContext,
   ) {
-    const { executable, args, shell } = formatArguments(binary, getNodeLaunchArgs(config));
+    const { executable, args, shell, cwd } = formatSubprocessArguments(
+      binary,
+      getNodeLaunchArgs(config),
+      config.cwd,
+    );
 
     // Send an appoximation of the command we're running to
     // the terminal, for cosmetic purposes.
     context.dap.output({
       category: 'console',
-      output: [executable, ...args].join(' '),
+      output: [executable, ...args].join(' ') + '\n',
     });
 
     const child = spawn(executable, args, {
       shell,
-      cwd: config.cwd,
+      cwd: cwd,
       env: EnvironmentVars.merge(EnvironmentVars.processEnv(), config.env).defined(),
     });
 
@@ -56,10 +62,14 @@ export class SubprocessProgramLauncher implements IProgramLauncher {
    * Called for a child process when the stdio should be written over DAP.
    */
   private captureStdio(dap: Dap.Api, child: ChildProcessWithoutNullStreams) {
-    child.stdout.on('data', data => dap.output({ category: 'stdout', output: data.toString() }));
-    child.stderr.on('data', data => dap.output({ category: 'stderr', output: data.toString() }));
-    child.stdout.resume();
-    child.stderr.resume();
+    child.stdout
+      .pipe(new EtxSplitter())
+      .on('data', output => dap.output({ category: 'stdout', output: output.toString() }))
+      .resume();
+    child.stderr
+      .pipe(new EtxSplitter())
+      .on('data', output => dap.output({ category: 'stderr', output: output.toString() }))
+      .resume();
   }
 
   /**
@@ -108,35 +118,39 @@ export class SubprocessProgramLauncher implements IProgramLauncher {
   }
 }
 
-// Fix for: https://github.com/microsoft/vscode/issues/45832,
-// which still seems to be a thing according to the issue tracker.
-// From: https://github.com/microsoft/vscode-node-debug/blob/47747454bc6e8c9e48d8091eddbb7ffb54a19bbe/src/node/nodeDebug.ts#L1120
-const formatArguments = (executable: string, args: ReadonlyArray<string>) => {
-  if (process.platform === 'win32' && executable.endsWith('.ps1')) {
-    args = ['-File', executable, ...args];
-    executable = 'powershell.exe';
+const enum Char {
+  ETX = 3,
+}
+
+/**
+ * The ETX character is used to signal the end of a record.
+ *
+ * This EtxSplitter will look out for ETX characters in the stream. If it
+ * finds any, it will switch from splitting the stream on newlines to
+ * splitting on ETX characters.
+ */
+export class EtxSplitter extends StreamSplitter {
+  private etxSpotted = false;
+
+  constructor() {
+    super(Char.ETX);
+    this.splitSuffix = Buffer.from('\n');
   }
 
-  if (process.platform !== 'win32' || !executable.includes(' ')) {
-    return { executable, args, shell: false };
-  }
-
-  let foundArgWithSpace = false;
-
-  // check whether there is one arg with a space
-  const output: string[] = [];
-  for (const a of args) {
-    if (a.includes(' ')) {
-      output.push(`"${a}"`);
-      foundArgWithSpace = true;
-    } else {
-      output.push(a);
+  override _transform(
+    chunk: Buffer,
+    _encoding: string,
+    callback: (error?: Error | null | undefined, data?: unknown) => void,
+  ): void {
+    if (!this.etxSpotted && chunk.includes(Char.ETX)) {
+      this.etxSpotted = true;
     }
-  }
 
-  if (foundArgWithSpace) {
-    return { executable: `"${executable}"`, args: output, shell: true };
-  }
+    if (!this.etxSpotted) {
+      this.push(chunk);
+      return callback();
+    }
 
-  return { executable, args, shell: false };
-};
+    return super._transform(chunk, _encoding, callback);
+  }
+}

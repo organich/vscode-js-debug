@@ -3,10 +3,11 @@
  *--------------------------------------------------------*/
 
 import { expect } from 'chai';
-import del from 'del';
+import { promises as fs } from 'fs';
 import { join } from 'path';
 import { readfile } from '../../common/fsUtils';
 import { forceForwardSlashes } from '../../common/pathUtils';
+import { absolutePathToFileUrlWithDetection } from '../../common/urlUtils';
 import Dap from '../../dap/api';
 import { createFileTree } from '../createFileTree';
 import { removeNodeInternalsStackLines } from '../goldenText';
@@ -96,11 +97,9 @@ describe('breakpoints', () => {
       // and makes sure it works identically.
       const cwd = r.workspacePath('web/tmp');
 
-      after(() =>
-        del([`${forceForwardSlashes(cwd)}/**`], {
-          force: true /* delete outside cwd */,
-        }),
-      );
+      after(async () => {
+        await fs.rm(cwd, { recursive: true, force: true });
+      });
 
       createFileTree(cwd, {
         'pause.js': await readfile(r.workspacePath('web/browserify/pause.js')),
@@ -140,11 +139,9 @@ describe('breakpoints', () => {
     itIntegrates("source map that's path mapped", async ({ r }) => {
       const cwd = r.workspacePath('web/tmp');
 
-      after(() =>
-        del([`${forceForwardSlashes(cwd)}/**`], {
-          force: true /* delete outside cwd */,
-        }),
-      );
+      after(async () => {
+        await fs.rm(cwd, { recursive: true, force: true });
+      });
 
       createFileTree(cwd, {
         'app.ts': await readfile(r.workspacePath('web/pathMapped/app.ts')),
@@ -206,13 +203,11 @@ describe('breakpoints', () => {
     itIntegrates('ref', async ({ r }) => {
       // Breakpoint in eval script set after launch using source reference.
       const p = await r.launchUrlAndLoad('index.html');
-      p.cdp.Runtime.evaluate({
-        expression: `
-        function foo() {
-          return 2;
-        }
-      `,
-      });
+      p.evaluate(`
+      function foo() {
+        return 2;
+      }
+    `);
       const { source } = await p.waitForSource('eval');
       source.path = undefined;
       await p.dap.setBreakpoints({ source, breakpoints: [{ line: 3 }] });
@@ -225,13 +220,11 @@ describe('breakpoints', () => {
     itIntegrates('remove', async ({ r }) => {
       // Breakpoint in eval script set after launch and immediately removed.
       const p = await r.launchUrlAndLoad('index.html');
-      p.cdp.Runtime.evaluate({
-        expression: `
+      p.evaluate(`
         function foo() {
           return 2;
         }
-      `,
-      });
+      `);
       const { source } = await p.waitForSource('eval');
       source.path = undefined;
       await p.dap.setBreakpoints({ source, breakpoints: [{ line: 3 }] });
@@ -244,14 +237,12 @@ describe('breakpoints', () => {
     itIntegrates('overwrite', async ({ r }) => {
       // Breakpoint in eval script set after launch and immediately overwritten.
       const p = await r.launchUrlAndLoad('index.html');
-      p.cdp.Runtime.evaluate({
-        expression: `
+      p.evaluate(`
         function foo() {
           var x = 3;
           return 2;
         }
-      `,
-      });
+      `);
       const { source } = await p.waitForSource('eval');
       source.path = undefined;
       await p.dap.setBreakpoints({ source, breakpoints: [{ line: 4 }] });
@@ -424,6 +415,8 @@ describe('breakpoints', () => {
         { line: 12, column: 0, logMessage: '{(x=>x+baz)(bar)}' },
         { line: 13, column: 0, logMessage: '{throw new Error("oof")}' },
         { line: 14, column: 0, logMessage: "{'hi'}" },
+        { line: 15, column: 0, logMessage: "{{foo: 'bar'}}" },
+        { line: 16, column: 0, logMessage: '{{f}}' },
       ];
       await p.dap.setBreakpoints({
         source,
@@ -595,8 +588,10 @@ describe('breakpoints', () => {
         source: { path: p.workspacePath('web/condition.js') },
         breakpoints: [{ line: 2, column: 0, condition: '(() => { throw "oh no" })()' }],
       });
+      const output = p.dap.once('output');
       p.load();
       await waitForPause(p);
+      await r.log(await output); // an error message
       p.assertLog();
     });
 
@@ -641,7 +636,10 @@ describe('breakpoints', () => {
       await p.evaluate(`document.querySelector('div').innerHTML = 'foo';`);
 
       p.log('Pausing on innerHTML');
-      await p.dap.enableCustomBreakpoints({ ids: ['instrumentation:Element.setInnerHTML'] });
+      await p.dap.setCustomBreakpoints({
+        ids: ['instrumentation:Element.setInnerHTML'],
+        xhr: [],
+      });
       p.evaluate(`document.querySelector('div').innerHTML = 'bar';`);
       const event = p.log(await p.dap.once('stopped'));
       p.log(await p.dap.continue({ threadId: event.threadId }));
@@ -769,6 +767,44 @@ describe('breakpoints', () => {
       handle.assertLog({ substring: true });
     });
 
+    itIntegrates('avoids double pathmapping (#1617)', async ({ r }) => {
+      // specifically check that the pathmapping is not used multiple times
+      // if the source path is an apparent child of the remote path. Requires
+      // the file in the sourcemap to be relative.
+      createFileTree(testFixturesDir, {
+        src: {
+          'double.js': "console.log('hello world');",
+        },
+        'double.js': [
+          "/*'Object.<anonymous>':function(module,exports,require,__dzrname,__fzlename,jest*/console.log('hello world');",
+          '//# sourceMappingURL=data:application/json;charset=utf-8;base64,'
+          + Buffer.from(
+            JSON.stringify({
+              version: 3,
+              names: ['console', 'log'],
+              sources: ['double.js'],
+              sourcesContent: ["console.log('hello world');\n"],
+              mappings: 'AAAAA,OAAO,CAACC,GAAG,CAAC,aAAa,CAAC',
+            }),
+          ).toString('base64'),
+        ],
+      });
+
+      const handle = await r.runScript('double.js', {
+        localRoot: join(testFixturesDir, 'src'),
+        remoteRoot: testFixturesDir,
+      });
+
+      await handle.dap.setBreakpoints({
+        source: { path: join(testFixturesDir, 'src', 'double.js') },
+        breakpoints: [{ line: 1, column: 1 }],
+      });
+
+      handle.load();
+      await waitForPause(handle);
+      r.assertLog({ substring: true });
+    });
+
     itIntegrates('does not adjust already correct', async ({ r }) => {
       await r.initialize;
 
@@ -885,7 +921,7 @@ describe('breakpoints', () => {
           handle.load();
           await waitForPause(handle);
           handle.assertLog({ substring: true });
-        }),
+        })
       );
     });
 
@@ -903,7 +939,7 @@ describe('breakpoints', () => {
           handle.load();
           await waitForPause(handle);
           handle.assertLog({ substring: true });
-        }),
+        })
       );
     });
   });
@@ -911,8 +947,7 @@ describe('breakpoints', () => {
   describe('hit count', () => {
     const doTest = async (r: TestRoot, run: (p: TestP, source: Dap.Source) => Promise<void>) => {
       const p = await r.launchUrlAndLoad('index.html');
-      p.cdp.Runtime.evaluate({
-        expression: `
+      p.evaluate(`
         function foo() {
           for (let i = 0; i < 10; i++) {
             console.log(i);
@@ -920,8 +955,7 @@ describe('breakpoints', () => {
             console.log(i);
           }
         }
-      `,
-      });
+      `);
       const { source } = await p.waitForSource('eval');
       source.path = undefined;
       await run(p, source);
@@ -944,7 +978,21 @@ describe('breakpoints', () => {
     itIntegrates('works for valid', async ({ r }) => {
       await doTest(r, async (p, source) => {
         r.log(
-          await p.dap.setBreakpoints({ source, breakpoints: [{ line: 4, hitCondition: '=5' }] }),
+          await p.dap.setBreakpoints({
+            source,
+            breakpoints: [{ line: 4, hitCondition: '=5' }],
+          }),
+        );
+        const evaluate = p.evaluate('foo();');
+        await waitForHit(p);
+        await evaluate;
+      });
+    });
+
+    itIntegrates('implies equal (#1698)', async ({ r }) => {
+      await doTest(r, async (p, source) => {
+        r.log(
+          await p.dap.setBreakpoints({ source, breakpoints: [{ line: 4, hitCondition: '5' }] }),
         );
         const evaluate = p.evaluate('foo();');
         await waitForHit(p);
@@ -955,10 +1003,16 @@ describe('breakpoints', () => {
     itIntegrates('can change after set', async ({ r }) => {
       await doTest(r, async (p, source) => {
         r.log(
-          await p.dap.setBreakpoints({ source, breakpoints: [{ line: 4, hitCondition: '=5' }] }),
+          await p.dap.setBreakpoints({
+            source,
+            breakpoints: [{ line: 4, hitCondition: '=5' }],
+          }),
         );
         r.log(
-          await p.dap.setBreakpoints({ source, breakpoints: [{ line: 4, hitCondition: '=8' }] }),
+          await p.dap.setBreakpoints({
+            source,
+            breakpoints: [{ line: 4, hitCondition: '=8' }],
+          }),
         );
         const evaluate = p.evaluate('foo();');
         await waitForHit(p);
@@ -1019,6 +1073,29 @@ describe('breakpoints', () => {
     await waitForPause(handle);
     handle.assertLog({ substring: true });
   });
+
+  itIntegrates(
+    'resolves sourcemaps in paths containing glob patterns (vscode#166400)',
+    async ({ r }) => {
+      await r.initialize;
+
+      const cwd = join(testWorkspace, 'glob(chars)');
+      const handle = await r.runScript(join(cwd, 'app.ts'), {
+        stopOnEntry: true,
+        smartStep: false,
+        outFiles: [`${cwd}/**/*.js`],
+        resolveSourceMapLocations: [`${cwd}/**/*.js`],
+      });
+      await handle.dap.setBreakpoints({
+        source: { path: join(cwd, 'app.ts') },
+        breakpoints: [{ line: 2, column: 1 }],
+      });
+
+      handle.load();
+      await waitForPause(handle);
+      handle.assertLog({ substring: true });
+    },
+  );
 
   itIntegrates('reevaluates breakpoints when new sources come in (#600)', async ({ r }) => {
     const p = await r.launchUrl('unique-refresh?v=1');
@@ -1153,6 +1230,21 @@ describe('breakpoints', () => {
     p.assertLog();
   });
 
+  itIntegrates('prefers file uris to url (#1598)', async ({ r }) => {
+    const file = join(testWorkspace, 'web/script.html');
+    const p = await r.launchUrl('script.html', { file });
+    r._launchUrl = absolutePathToFileUrlWithDetection(file); // fix so navigation is right
+
+    const source: Dap.Source = {
+      path: p.workspacePath('web/script.js'),
+    };
+    await p.dap.setBreakpoints({ source, breakpoints: [{ line: 9, column: 0 }] });
+    p.load();
+    await waitForPause(p);
+    await waitForPause(p);
+    p.assertLog();
+  });
+
   itIntegrates('stepInTargets', async ({ r }) => {
     const p = await r.launchUrl('stepInTargets.html');
     const src = p.waitForSource('stepInTargets.js');
@@ -1203,6 +1295,123 @@ describe('breakpoints', () => {
     }
 
     await evaluation;
+    p.assertLog();
+  });
+
+  itIntegrates(
+    'does not interrupt stepOver with instrumentation breakpoint (#1556)',
+    async ({ r }) => {
+      async function pauseAndNext(p: ITestHandle) {
+        const { threadId } = p.log(await p.dap.once('stopped'));
+        await p.logger.logStackTrace(threadId);
+        return p.dap.next({ threadId });
+      }
+
+      const p = await r.launchAndLoad(`
+        <script>
+          function test() {
+            debugger;
+            f=eval(\`
+              (function (a, b) {
+                c = a + b;
+                return c;
+              });
+              //# sourceURL=foo.js
+              //# sourceMappingURL=foo.js.map
+            \`);
+            f(1, 2);
+          }
+        </script>`);
+
+      const evaluate = p.evaluate('test()');
+
+      await pauseAndNext(p); // debugger statement
+      await pauseAndNext(p); // f=eval(...
+      await waitForPause(p); // should now be on f(1, 2)
+
+      await evaluate;
+      p.assertLog();
+    },
+  );
+
+  itIntegrates(
+    'does not interrupt stepIn with instrumentation breakpoint (#1665)',
+    async ({ r }) => {
+      const p = await r.launchAndLoad(`
+        <script>
+          function test() {
+            debugger;
+            f=eval(\`
+              (function (a, b) {
+                c = a + b;
+                return c;
+              });
+              //# sourceURL=foo.js
+              //# sourceMappingURL=foo.js.map
+            \`);
+            f(1, 2);
+          }
+        </script>`);
+
+      const evaluate = p.evaluate('test()');
+
+      const a = p.log(await p.dap.once('stopped')); // debugger statement
+      await p.logger.logStackTrace(a.threadId);
+      await p.dap.stepIn({ threadId: a.threadId });
+
+      const b = p.log(await p.dap.once('stopped')); // f=eval(...
+      await p.logger.logStackTrace(b.threadId);
+      await p.dap.stepIn({ threadId: b.threadId });
+
+      await waitForPause(p); // should now be on (function (a, b)
+
+      await evaluate;
+      p.assertLog();
+    },
+  );
+
+  itIntegrates('deals with removed execution contexts (#1582)', async ({ r }) => {
+    const p = await r.launchUrlAndLoad('iframe-1582/index.html');
+
+    const source: Dap.Source = {
+      path: p.workspacePath('web/iframe-1582/inner.js'),
+    };
+    p.dap.setBreakpoints({ source, breakpoints: [{ line: 3 }] });
+    await waitForPause(p, async () => {
+      await p.dap.evaluate({
+        expression: 'document.getElementsByTagName("IFRAME")[0].src += ""',
+        context: 'repl',
+      });
+    });
+
+    await waitForPause(p, async () => {
+      await p.dap.setBreakpoints({ source, breakpoints: [] });
+    });
+
+    // re-sets the breakpoints in the new script
+    p.dap.setBreakpoints({ source, breakpoints: [{ line: 3 }] });
+
+    await waitForPause(p);
+    p.assertLog();
+  });
+
+  itIntegrates('sets file uri breakpoints predictably (#1748)', async ({ r }) => {
+    createFileTree(testFixturesDir, {
+      'pages/main.html': '<script src="../scripts/hello.js"></script>',
+      'scripts/hello.js': 'console.log(42)',
+    });
+
+    const mainFile = join(testFixturesDir, 'pages/main.html');
+    const p = await r.launchUrl(absolutePathToFileUrlWithDetection(mainFile), {
+      url: undefined,
+      file: mainFile,
+    });
+
+    const source: Dap.Source = { path: join(testFixturesDir, 'scripts/hello.js') };
+    await p.dap.setBreakpoints({ source, breakpoints: [{ line: 1 }] });
+    p.load();
+
+    await waitForPause(p);
     p.assertLog();
   });
 });

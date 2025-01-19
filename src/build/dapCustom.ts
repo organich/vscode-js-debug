@@ -81,30 +81,24 @@ const makeRequest = (
 
 const dapCustom: JSONSchema4 = {
   definitions: {
-    ...makeRequest('enableCustomBreakpoints', 'Enable custom breakpoints.', {
+    ...makeRequest('setCustomBreakpoints', 'Sets the enabled custom breakpoints.', {
       properties: {
         ids: {
           type: 'array',
           items: {
             type: 'string',
           },
-          description: 'Id of breakpoints to enable.',
+          description: 'Id of breakpoints that should be enabled.',
         },
-      },
-      required: ['ids'],
-    }),
-
-    ...makeRequest('disableCustomBreakpoints', 'Disable custom breakpoints.', {
-      properties: {
-        ids: {
+        xhr: {
           type: 'array',
           items: {
             type: 'string',
           },
-          description: 'Id of breakpoints to enable.',
+          description: 'strings of XHR breakpoints that should be enabled.',
         },
       },
-      required: ['ids'],
+      required: ['ids', 'xhr'],
     }),
 
     ...makeRequest('prettyPrintSource', 'Pretty prints source for debugging.', {
@@ -602,10 +596,235 @@ const dapCustom: JSONSchema4 = {
             supportsDebuggerProperties: {
               type: 'boolean',
             },
+            supportsEvaluationOptions: {
+              type: 'boolean',
+            },
+            supportsSetSymbolOptions: {
+              type: 'boolean',
+              description: 'The debug adapter supports the set symbol options request',
+            },
           },
         },
       ],
     },
+
+    ...makeRequest('evaluationOptions', 'Used by evaluate and variables.', {
+      properties: {
+        evaluateParams: {
+          $ref: '#/definitions/EvaluateParamsExtended',
+        },
+        variablesParams: {
+          $ref: '#/definitions/VariablesParamsExtended',
+        },
+        stackTraceParams: {
+          $ref: '#/definitions/StackTraceParamsExtended',
+        },
+      },
+    }),
+
+    EvaluationOptions: {
+      type: 'object',
+      description:
+        'Options passed to expression evaluation commands ("evaluate" and "variables") to control how the evaluation occurs.',
+      properties: {
+        treatAsStatement: {
+          type: 'boolean',
+          description: 'Evaluate the expression as a statement.',
+        },
+        allowImplicitVars: {
+          type: 'boolean',
+          description: 'Allow variables to be declared as part of the expression.',
+        },
+        noSideEffects: {
+          type: 'boolean',
+          description: 'Evaluate without side effects.',
+        },
+        noFuncEval: {
+          type: 'boolean',
+          description: 'Exclude funceval during evaluation.',
+        },
+        noToString: {
+          type: 'boolean',
+          description: 'Exclude calling `ToString` during evaluation.',
+        },
+        forceEvaluationNow: {
+          type: 'boolean',
+          description: 'Evaluation should take place immediately if possible.',
+        },
+        forceRealFuncEval: {
+          type: 'boolean',
+          description: 'Exclude interpretation from evaluation methods.',
+        },
+        runAllThreads: {
+          type: 'boolean',
+          description: 'Allow all threads to run during the evaluation.',
+        },
+        rawStructures: {
+          type: 'boolean',
+          description:
+            "The 'raw' view of objects and structions should be shown - visualization improvements should be disabled.",
+        },
+        filterToFavorites: {
+          type: 'boolean',
+          description:
+            'Variables responses containing favorites should be filtered to only those items',
+        },
+        simpleDisplayString: {
+          type: 'boolean',
+          description:
+            'Auto generated display strings for variables with favorites should not include field names.',
+        },
+      },
+    },
+
+    EvaluateParamsExtended: {
+      allOf: [
+        { $ref: '#/definitions/EvaluateParams' },
+        {
+          type: 'object',
+          description: 'Extension of EvaluateParams',
+          properties: {
+            evaluationOptions: {
+              $ref: '#/definitions/EvaluationOptions',
+            },
+          },
+        },
+      ],
+    },
+
+    VariablesParamsExtended: {
+      allOf: [
+        { $ref: '#/definitions/VariablesParams' },
+        {
+          type: 'object',
+          description: 'Extension of VariablesParams',
+          properties: {
+            evaluationOptions: {
+              $ref: '#/definitions/EvaluationOptions',
+            },
+          },
+        },
+      ],
+    },
+
+    StackTraceParamsExtended: {
+      allOf: [
+        { $ref: '#/definitions/StackTraceParams' },
+        {
+          type: 'object',
+          description: 'Extension of StackTraceParams',
+          properties: {
+            noFuncEval: {
+              type: 'boolean',
+            },
+          },
+        },
+      ],
+    },
+
+    ...makeRequest('setSymbolOptions', 'Sets options for locating symbols.'),
+
+    SetSymbolOptionsArguments: {
+      type: 'object',
+      description:
+        'Arguments for "setSymbolOptions" request. Properties are determined by debugger.',
+    },
+
+    ...makeEvent(
+      'networkEvent',
+      'A wrapped CDP network event. There is little abstraction here because UI interacts literally with CDP at the moment.',
+      {
+        properties: {
+          event: {
+            type: 'string',
+            description: 'The CDP network event name',
+          },
+          data: {
+            type: 'object',
+            description: 'The CDP network data',
+          },
+        },
+        required: ['event', 'data'],
+      },
+    ),
+
+    ...makeRequest(
+      'networkCall',
+      'Makes a network call. There is little abstraction here because UI interacts literally with CDP at the moment.',
+      {
+        properties: {
+          method: {
+            type: 'string',
+            description: 'The HTTP method',
+          },
+          params: {
+            type: 'object',
+            description: 'The CDP call parameters',
+          },
+        },
+        required: ['method', 'params'],
+      },
+      {
+        type: 'object',
+      },
+    ),
+
+    ...makeRequest(
+      'enableNetworking',
+      'Attempts to enable networking on the target.',
+      {
+        properties: {
+          mirrorEvents: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'CDP network domain events to mirror (e.g. "requestWillBeSent")',
+          },
+        },
+        required: ['mirrorEvents'],
+      },
+      {
+        type: 'object',
+      },
+    ),
+
+    ...makeRequest(
+      'getPreferredUILocation',
+      'Resolves a compiled location into a preferred source location. May be used by other VS Code extensions.',
+      {
+        properties: {
+          source: {
+            $ref: '#/definitions/Source',
+            description: 'The source to look up.',
+          },
+          line: {
+            type: 'integer',
+            description: 'The base-0 line number to look up.',
+          },
+          column: {
+            type: 'integer',
+            description: 'The base-0 column number to look up.',
+          },
+        },
+        required: ['source', 'line', 'column'],
+      },
+      {
+        properties: {
+          source: {
+            $ref: '#/definitions/Source',
+            description: 'The resolved source.',
+          },
+          line: {
+            type: 'integer',
+            description: 'The base-0 line number in the source.',
+          },
+          column: {
+            type: 'integer',
+            description: 'The base-0 column number in the source.',
+          },
+        },
+        required: ['source', 'line', 'column'],
+      },
+    ),
   },
 };
 

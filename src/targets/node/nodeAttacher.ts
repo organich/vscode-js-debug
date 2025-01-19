@@ -2,10 +2,9 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { inject, injectable } from 'inversify';
-import * as nls from 'vscode-nls';
 import { IPortLeaseTracker } from '../../adapter/portLeaseTracker';
-import { getSourceSuffix } from '../../adapter/templates';
 import Cdp from '../../cdp/api';
 import { CancellationTokenSource } from '../../common/cancellation';
 import { DebugType } from '../../common/contributionUtils';
@@ -16,16 +15,15 @@ import { AnyLaunchConfiguration, INodeAttachConfiguration } from '../../configur
 import { retryGetNodeEndpoint } from '../browser/spawn/endpoints';
 import { ISourcePathResolverFactory } from '../sourcePathResolverFactory';
 import { IStopMetadata } from '../targets';
+import { killTree } from './killTree';
 import { LeaseFile } from './lease-file';
 import { NodeAttacherBase } from './nodeAttacherBase';
 import { watchAllChildren } from './nodeAttacherCluster';
 import { INodeBinaryProvider, NodeBinary } from './nodeBinaryProvider';
-import { IRunData } from './nodeLauncherBase';
+import { IProcessTelemetry, IRunData } from './nodeLauncherBase';
 import { IProgram, StubProgram, WatchDogProgram } from './program';
 import { IRestartPolicy, RestartPolicyFactory } from './restartPolicy';
 import { WatchDog } from './watchdogSpawn';
-
-const localize = nls.loadMessageBundle();
 
 /**
  * Attaches to ongoing Node processes. This works pretty similar to the
@@ -36,6 +34,8 @@ const localize = nls.loadMessageBundle();
  */
 @injectable()
 export class NodeAttacher extends NodeAttacherBase<INodeAttachConfiguration> {
+  private telemetry?: IProcessTelemetry;
+
   constructor(
     @inject(INodeBinaryProvider) pathProvider: INodeBinaryProvider,
     @inject(ILogger) logger: ILogger,
@@ -88,6 +88,7 @@ export class NodeAttacher extends NodeAttacherBase<INodeAttachConfiguration> {
         ipcAddress: runData.serverAddress,
         scriptName: 'Remote Process',
         inspectorURL,
+        remoteHostHeader: runData.params.remoteHostHeader,
         waitForDebugger: true,
         dynamicAttach: true,
       });
@@ -117,11 +118,7 @@ export class NodeAttacher extends NodeAttacherBase<INodeAttachConfiguration> {
       }
 
       runData.context.dap.output({
-        output: localize(
-          'node.attach.restart.message',
-          'Lost connection to debugee, reconnecting in {0}ms\r\n',
-          nextRestart.delay,
-        ),
+        output: l10n.t('Lost connection to debugee, reconnecting in {0}ms\r\n', nextRestart.delay),
       });
 
       const deferred = new StubProgram();
@@ -142,10 +139,18 @@ export class NodeAttacher extends NodeAttacherBase<INodeAttachConfiguration> {
     return doLaunch(this.restarters.create(runData.params.restart));
   }
 
+  public override async terminate(terminateDebuggee?: boolean): Promise<void> {
+    await super.terminate();
+
+    if (terminateDebuggee && this.telemetry) {
+      killTree(this.telemetry.processId, this.logger);
+    }
+  }
+
   /**
    * @override
    */
-  protected createLifecycle(
+  protected override createLifecycle(
     cdp: Cdp.Api,
     run: IRunData<INodeAttachConfiguration>,
     target: Cdp.Target.TargetInfo,
@@ -183,11 +188,20 @@ export class NodeAttacher extends NodeAttacherBase<INodeAttachConfiguration> {
     const leaseFile = new LeaseFile();
     await leaseFile.startTouchLoop();
 
-    const binary = await this.resolveNodePath(run.params);
+    let binary = new NodeBinary('node', undefined);
+    try {
+      binary = await this.resolveNodePath(run.params);
+    } catch {
+      // ignored -- not really a big deal, just used to find capabilities for
+      // attach params, but all Node versions post-12 will have the same behavior.
+    }
+
     const [telemetry] = await Promise.all([
       this.gatherTelemetryFromCdp(cdp, run),
       this.setEnvironmentVariables(cdp, run, leaseFile.path, parentInfo.targetId, binary),
     ]);
+
+    this.telemetry = telemetry;
 
     if (telemetry && run.params.attachExistingChildren) {
       watchAllChildren(
@@ -221,28 +235,10 @@ export class NodeAttacher extends NodeAttacherBase<INodeAttachConfiguration> {
       return;
     }
 
-    const vars = await this.resolveEnvironment(run, binary, { requireLease: leasePath, openerId });
-    for (let retries = 0; retries < 5; retries++) {
-      const result = await cdp.Runtime.evaluate({
-        contextId: 1,
-        returnByValue: true,
-        expression:
-          `typeof process === 'undefined' || process.pid === undefined ? 'process not defined' : Object.assign(process.env, ${JSON.stringify(
-            vars.defined(),
-          )})` + getSourceSuffix(),
-      });
-
-      if (!result) {
-        this.logger.error(LogTag.RuntimeTarget, 'Undefined result setting child environment vars');
-        return;
-      }
-
-      if (!result.exceptionDetails && result.result.value !== 'process not defined') {
-        return;
-      }
-
-      this.logger.error(LogTag.RuntimeTarget, 'Error setting child environment vars', result);
-      await delay(50);
-    }
+    const vars = await this.resolveEnvironment(run, binary, {
+      requireLease: leasePath,
+      openerId,
+    });
+    return this.appendEnvironmentVariables(cdp, vars);
   }
 }

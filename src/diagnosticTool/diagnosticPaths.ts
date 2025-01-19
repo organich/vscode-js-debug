@@ -3,23 +3,22 @@
  *--------------------------------------------------------*/
 
 import { IDiagnosticDump, IDiagnosticSource } from '../adapter/diagnosics';
-import { DebugType } from '../common/contributionUtils';
 
 const nodeInternalMarker = '<node_internals>';
 const node16InternalUrl = 'node:';
 
 export const isNodeType = (dump: IDiagnosticDump) =>
-  dump.config.type === DebugType.Node ||
-  dump.config.type === DebugType.ExtensionHost ||
-  dump.config.type === DebugType.Terminal;
+  dump.config.type === 'pwa-node'
+  || dump.config.type === 'pwa-extensionHost'
+  || dump.config.type === 'node-terminal';
 
 export const isBrowserType = (dump: IDiagnosticDump) =>
-  dump.config.type === DebugType.Chrome || dump.config.type === DebugType.Edge;
+  dump.config.type === 'pwa-chrome' || dump.config.type === 'pwa-msedge';
 
 export const sortScore = (source: IDiagnosticSource) => {
   if (
-    source.absolutePath.startsWith(nodeInternalMarker) ||
-    source.url.startsWith(node16InternalUrl)
+    source.absolutePath.startsWith(nodeInternalMarker)
+    || source.url.startsWith(node16InternalUrl)
   ) {
     return 2;
   }

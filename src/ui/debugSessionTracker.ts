@@ -137,13 +137,9 @@ export class DebugSessionTracker implements vscode.Disposable {
             options.selection = new vscode.Range(position, position);
           }
           vscode.window.showTextDocument(uri, options);
-          return;
-        }
-
-        if (event.event === 'copyRequested') {
+        } else if (event.event === 'copyRequested') {
           const params = event.body as Dap.CopyRequestedEventParams;
           vscode.env.clipboard.writeText(params.text);
-          return;
         }
       },
       undefined,

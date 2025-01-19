@@ -3,22 +3,34 @@
  *--------------------------------------------------------*/
 
 import { expect } from 'chai';
-import del from 'del';
+import esbuild from 'esbuild';
+import { promises as fs } from 'fs';
 import { join, resolve } from 'path';
 import { Worker } from 'worker_threads';
-import { Hasher } from '.';
 import { createFileTree, getTestDir } from '../../test/createFileTree';
+import { Hasher } from '.';
 import { HashMode } from './hash';
 
-const hashTestCaseDir = resolve(__dirname, '../../../../testWorkspace/hashTestCases');
+const hashTestCaseDir = resolve(__dirname, '../../../testWorkspace/hashTestCases');
 
-describe('hash process', function () {
+describe('hash process', function() {
   this.timeout(15_000);
   let hasher: Hasher;
+  let hashScript: string;
   let testDir: string;
 
-  before(() => {
-    hasher = new Hasher();
+  before(async () => {
+    hashScript = join(hashTestCaseDir, 'hash.js');
+    const src = await esbuild.transform(await fs.readFile(join(__dirname, 'hash.ts')), {
+      loader: 'ts',
+    });
+    fs.writeFile(hashScript, src.code);
+
+    hasher = new Hasher(undefined, hashScript);
+  });
+
+  after(async () => {
+    await fs.rm(hashScript);
   });
 
   beforeEach(() => {
@@ -26,7 +38,7 @@ describe('hash process', function () {
   });
 
   afterEach(async () => {
-    await del(testDir, { force: true });
+    await fs.rm(testDir, { recursive: true, force: true });
   });
 
   after(() => {
@@ -37,19 +49,19 @@ describe('hash process', function () {
     /**
      *  different encodings for the same string: "\"1111111111111111111111111111111111111111111\""
      */
-    // prettier-ignore
+    // dprint-ignore
     const utf8NoBOM = Buffer.from([0x22, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
     0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
     0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
     0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
     0x31, 0x22]);
-    // prettier-ignore
+    // dprint-ignore
     const utf8BOM = Buffer.from([
     0xEF, 0xBB, 0xBF, 0x22, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
     0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
     0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
     0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x22]);
-    // prettier-ignore
+    // dprint-ignore
     const utf16BigEndianBOM = Buffer.from([
     0xFE, 0xFF, 0x00, 0x22, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31,
     0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31,
@@ -59,7 +71,7 @@ describe('hash process', function () {
     0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31,
     0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31,
     0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x22]);
-    // prettier-ignore
+    // dprint-ignore
     const utf16LittleEndianBOM = Buffer.from([
     0xFF, 0xFE, 0x22, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00,
     0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00, 0x31, 0x00,
@@ -75,13 +87,16 @@ describe('hash process', function () {
       expect(await hasher.hashBytes(HashMode.Chromehash, utf8NoBOM)).to.equal(expected);
       expect(await hasher.hashBytes(HashMode.Chromehash, utf8BOM)).to.equal(expected);
       expect(await hasher.hashBytes(HashMode.Chromehash, utf16BigEndianBOM)).to.equal(expected);
-      expect(await hasher.hashBytes(HashMode.Chromehash, utf16LittleEndianBOM)).to.equal(expected);
+      expect(await hasher.hashBytes(HashMode.Chromehash, utf16LittleEndianBOM)).to.equal(
+        expected,
+      );
     });
 
     it('files', async () => {
-      expect(await hasher.hashFile(HashMode.Chromehash, join(hashTestCaseDir, 'blns.js'))).to.equal(
-        '3b33b447a9e19333659bb21c05ce7a0f414776b9',
-      );
+      expect(await hasher.hashFile(HashMode.Chromehash, join(hashTestCaseDir, 'blns.js'))).to
+        .equal(
+          '3b33b447a9e19333659bb21c05ce7a0f414776b9',
+        );
       expect(
         await hasher.hashFile(HashMode.Chromehash, join(hashTestCaseDir, 'simple.js')),
       ).to.equal('1283dfddaa33715f0e953c443e071f361de1c9c5');
@@ -115,18 +130,22 @@ describe('hash process', function () {
       expect(await hasher.hashFile(HashMode.SHA256, join(hashTestCaseDir, 'blns.js'))).to.equal(
         'bd2f90038c4ea269f2f610d3502de20f98eb2359eec6ed2da152c52cc861d596',
       );
-      expect(await hasher.hashFile(HashMode.SHA256, join(hashTestCaseDir, 'simple.js'))).to.equal(
-        'a8217b64f8d6315a5e8fcdc751bff2069a118575d0d9327fc069fb4f060f04a2',
-      );
-      expect(await hasher.hashFile(HashMode.SHA256, join(hashTestCaseDir, 'utf16be.js'))).to.equal(
-        'f7bc3e22e6000869ab4a70052ee353336ac8ff9b63e8d2a343a4fe6e659def9a',
-      );
-      expect(await hasher.hashFile(HashMode.SHA256, join(hashTestCaseDir, 'utf16le.js'))).to.equal(
-        'f7bc3e22e6000869ab4a70052ee353336ac8ff9b63e8d2a343a4fe6e659def9a',
-      );
-      expect(await hasher.hashFile(HashMode.SHA256, join(hashTestCaseDir, 'utf8-bom.js'))).to.equal(
-        'a8217b64f8d6315a5e8fcdc751bff2069a118575d0d9327fc069fb4f060f04a2',
-      );
+      expect(await hasher.hashFile(HashMode.SHA256, join(hashTestCaseDir, 'simple.js'))).to
+        .equal(
+          'a8217b64f8d6315a5e8fcdc751bff2069a118575d0d9327fc069fb4f060f04a2',
+        );
+      expect(await hasher.hashFile(HashMode.SHA256, join(hashTestCaseDir, 'utf16be.js'))).to
+        .equal(
+          'f7bc3e22e6000869ab4a70052ee353336ac8ff9b63e8d2a343a4fe6e659def9a',
+        );
+      expect(await hasher.hashFile(HashMode.SHA256, join(hashTestCaseDir, 'utf16le.js'))).to
+        .equal(
+          'f7bc3e22e6000869ab4a70052ee353336ac8ff9b63e8d2a343a4fe6e659def9a',
+        );
+      expect(await hasher.hashFile(HashMode.SHA256, join(hashTestCaseDir, 'utf8-bom.js'))).to
+        .equal(
+          'a8217b64f8d6315a5e8fcdc751bff2069a118575d0d9327fc069fb4f060f04a2',
+        );
     });
 
     it('verifies files when hash matches', async () => {

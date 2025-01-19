@@ -2,7 +2,7 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import del from 'del';
+import { promises as fs } from 'fs';
 import * as gulp from 'gulp';
 import { tmpdir } from 'os';
 import * as path from 'path';
@@ -41,7 +41,7 @@ import { getLogFileForTest } from './reporters/logReporterUtils';
 
 export const kStabilizeNames = ['id', 'threadId', 'sourceReference', 'variablesReference'];
 
-export const workspaceFolder = path.join(__dirname, '..', '..', '..');
+export const workspaceFolder = path.join(__dirname, '..', '..');
 export const testWorkspace = path.join(workspaceFolder, 'testWorkspace');
 export const testSources = path.join(workspaceFolder, 'src');
 export const testFixturesDirName = '.dynamic-testWorkspace';
@@ -103,7 +103,6 @@ class Session {
   }
 
   async _init(): Promise<Dap.InitializeResult> {
-    await this.adapterConnection.dap();
     const [r] = await Promise.all([
       this.dap.initialize({
         clientID: 'pwa-test',
@@ -257,7 +256,7 @@ export class TestP implements ITestHandle {
     await this.dap.attach({});
     this._cdp!.Page.enable({});
     this._cdp!.Page.navigate({ url: this._root._launchUrl! });
-    await new Promise(f => this._cdp!.Page.on('loadEventFired', f));
+    await new Promise(f => this._cdp!.Page.on('frameStoppedLoading', f));
     await this._cdp!.Page.disable({});
   }
 }
@@ -294,7 +293,8 @@ export class NodeTestHandle implements ITestHandle {
 
   waitForSource(filter?: string): Promise<Dap.LoadedSourceEventParams> {
     return this.dap.once('loadedSource', event => {
-      return filter === undefined || forceForwardSlashes(event.source.path || '').includes(filter);
+      return filter === undefined
+        || forceForwardSlashes(event.source.path || '').includes(filter);
     });
   }
 
@@ -345,9 +345,7 @@ export class TestRoot {
     this._args = ['--headless'];
     this.log = goldenText.log.bind(goldenText);
     this.assertLog = goldenText.assertLog.bind(goldenText);
-    this._workspaceRoot = utils.platformPathToPreferredCase(
-      path.join(__dirname, '..', '..', '..', 'testWorkspace'),
-    );
+    this._workspaceRoot = utils.platformPathToPreferredCase(testWorkspace);
     this._webRoot = path.join(this._workspaceRoot, 'web');
 
     const storagePath = path.join(__dirname, '..', '..');
@@ -374,14 +372,13 @@ export class TestRoot {
 
     this.logger = services.get(ILogger);
     this._root = new Session(this.logger);
-    this._root.adapterConnection.dap().then(dap => {
-      dap.on('initialize', async () => {
-        dap.initialized({});
-        return DebugAdapter.capabilities();
-      });
-      dap.on('configurationDone', async () => {
-        return {};
-      });
+    const dap = this._root.adapterConnection.dap();
+    dap.on('initialize', async () => {
+      dap.initialized({});
+      return DebugAdapter.capabilities();
+    });
+    dap.on('configurationDone', async () => {
+      return {};
     });
 
     this.binder = new Binder(this, this._root.adapterConnection, services, new TargetOrigin('0'));
@@ -394,7 +391,9 @@ export class TestRoot {
   }
 
   public async acquireDap(target: ITarget): Promise<DapConnection> {
-    const p = target.type() === 'page' ? new TestP(this, target) : new NodeTestHandle(this, target);
+    const p = target.type() === 'page'
+      ? new TestP(this, target)
+      : new NodeTestHandle(this, target);
     this._targetToP.set(target, p);
     return p._session.adapterConnection;
   }
@@ -511,14 +510,16 @@ export class TestRoot {
       // private prefix, but Chrome sees it, so make sure it matches here.
       tmpPath = `/private/${tmpPath}`;
     }
-    after(() => del(`${forceForwardSlashes(tmpPath)}/**`, { force: true }));
+    after(async () => {
+      await fs.rm(tmpPath, { recursive: true, force: true });
+    });
 
     await new Promise((resolve, reject) =>
       gulp
         .src('**/*.*', { cwd: path.dirname(filename) })
         .pipe(gulp.dest(tmpPath))
         .on('end', resolve)
-        .on('error', reject),
+        .on('error', reject)
     );
 
     this._root.dap.launch({
@@ -560,7 +561,8 @@ export class TestRoot {
       __workspaceFolder: this._workspaceRoot,
       ...options,
     } as INodeAttachConfiguration);
-    const result = await new Promise(f => (this._launchCallback = f));
+    const result = await new Promise<ITestHandle>(f => (this._launchCallback = f));
+    await result.load();
     return result as NodeTestHandle;
   }
 

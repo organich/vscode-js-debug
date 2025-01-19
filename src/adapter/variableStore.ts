@@ -2,12 +2,12 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as l10n from '@vscode/l10n';
 import { generate } from 'astring';
 import { inject, injectable } from 'inversify';
-import * as nls from 'vscode-nls';
 import Cdp from '../cdp/api';
 import { ICdpApi } from '../cdp/connection';
-import { flatten } from '../common/objUtils';
+import { flatten, isInstanceOf, once } from '../common/objUtils';
 import { parseSource, statementsToFunction } from '../common/sourceCodeManipulations';
 import { IRenameProvider } from '../common/sourceMaps/renameProvider';
 import { AnyLaunchConfiguration } from '../configuration';
@@ -15,18 +15,22 @@ import Dap from '../dap/api';
 import { IDapApi } from '../dap/connection';
 import * as errors from '../dap/errors';
 import { ProtocolError } from '../dap/protocolError';
+import { IWasmVariable, IWasmVariableEvaluation, WasmScope } from './dwarf/wasmSymbolProvider';
 import * as objectPreview from './objectPreview';
+import { MapPreview, SetPreview } from './objectPreview/betterTypes';
 import { PreviewContextType } from './objectPreview/contexts';
 import { StackFrame, StackTrace } from './stackTrace';
-import { getSourceSuffix, RemoteException } from './templates';
+import { getSourceSuffix, RemoteException, RemoteObjectId } from './templates';
 import { getArrayProperties } from './templates/getArrayProperties';
 import { getArraySlots } from './templates/getArraySlots';
-import { getStringyProps, getToStringIfCustom } from './templates/getStringyProps';
+import {
+  getDescriptionSymbols,
+  getStringyProps,
+  getToStringIfCustom,
+} from './templates/getStringyProps';
 import { invokeGetter } from './templates/invokeGetter';
 import { readMemory } from './templates/readMemory';
 import { writeMemory } from './templates/writeMemory';
-
-const localize = nls.loadMessageBundle();
 
 const getVariableId = (() => {
   let last = 0;
@@ -76,6 +80,8 @@ const enum SortOrder {
   Internal = 2,
 }
 
+const customStringReprMaxLength = 1024;
+
 const identifierRe = /^[$a-z_][0-9a-z_$]*$/i;
 const privatePropertyRe = /^#[0-9a-z_$]+$/i;
 
@@ -84,7 +90,7 @@ type AnyPropertyDescriptor = Cdp.Runtime.PropertyDescriptor | Cdp.Runtime.Privat
 const isPublicDescriptor = (p: AnyPropertyDescriptor): p is Cdp.Runtime.PropertyDescriptor =>
   p.hasOwnProperty('configurable');
 
-const extractFunctionFromCustomDescriptionGenerator = (
+const extractFunctionFromCustomGenerator = (
   parameterNames: string[],
   generatorDefinition: string,
   catchAndReturnErrors: boolean,
@@ -95,6 +101,24 @@ const extractFunctionFromCustomDescriptionGenerator = (
     catchAndReturnErrors,
   );
   return generate(code);
+};
+
+const indescribablePrefix = '<<indescribable>>';
+
+const localizeIndescribable = (str: string) => {
+  if (!str.startsWith(indescribablePrefix)) {
+    return str;
+  }
+
+  let error;
+  let key;
+  try {
+    [error, key] = JSON.parse(str.slice(indescribablePrefix.length));
+  } catch {
+    return str;
+  }
+
+  return l10n.t("{0} (couldn't describe: {1})", error, key);
 };
 
 /**
@@ -137,8 +161,8 @@ export interface IStoreSettings {
   customPropertiesGenerator?: string;
 }
 
-type VariableCtor<TRestArgs extends unknown[] = unknown[], R extends Variable = Variable> = {
-  new (context: VariableContext, ...rest: TRestArgs): R;
+type VariableCtor<TRestArgs extends unknown[] = unknown[], R extends IVariable = IVariable> = {
+  new(context: VariableContext, ...rest: TRestArgs): R;
 };
 
 interface IContextInit {
@@ -148,6 +172,18 @@ interface IContextInit {
   sortOrder?: number;
 }
 
+interface IContextSettings {
+  customDescriptionGenerator?: string;
+  customPropertiesGenerator?: string;
+  descriptionSymbols?: Promise<Cdp.Runtime.CallArgument>;
+}
+
+const wasmScopeNames: { [K in WasmScope]: { name: string; sortOrder: number } } = {
+  [WasmScope.Parameter]: { name: l10n.t('Parameters'), sortOrder: -10 },
+  [WasmScope.Local]: { name: l10n.t('Locals'), sortOrder: -9 },
+  [WasmScope.Global]: { name: l10n.t('Globals'), sortOrder: -8 },
+};
+
 class VariableContext {
   /** When in a Variable, the name that this variable is accessible as from its parent scope or object */
   public readonly name: string;
@@ -156,17 +192,18 @@ class VariableContext {
   /** Sort order set from the parent. */
   public readonly sortOrder: number;
 
+  public get customDescriptionGenerator() {
+    return this.settings.customDescriptionGenerator;
+  }
+
   constructor(
     public readonly cdp: Cdp.Api,
-    public readonly parent: undefined | Variable | Scope,
+    public readonly parent: undefined | IVariable | Scope,
     ctx: IContextInit,
     private readonly vars: VariablesMap,
     public readonly locationProvider: IVariableStoreLocationProvider,
-    private readonly currentRef: undefined | (() => Variable | Scope),
-    private readonly settings: {
-      customDescriptionGenerator?: string;
-      customPropertiesGenerator?: string;
-    },
+    private readonly currentRef: undefined | (() => IVariable | Scope),
+    private readonly settings: IContextSettings,
   ) {
     this.name = ctx.name;
     this.presentationHint = ctx.presentationHint;
@@ -230,26 +267,50 @@ class VariableContext {
       return this.createVariable(ArrayVariable, ctx, object);
     }
 
-    if (object.objectId && !objectPreview.subtypesWithoutPreview.has(object.subtype)) {
-      return this.createVariable(ObjectVariable, ctx, object, customStringRepr);
+    if (object.objectId) {
+      if (object.type === 'function') {
+        return this.createVariable(FunctionVariable, ctx, object, customStringRepr);
+      } else if (object.subtype === 'map' || object.subtype === 'set') {
+        return this.createVariable(SetOrMapVariable, ctx, object, customStringRepr);
+      } else if (!objectPreview.subtypesWithoutPreview.has(object.subtype)) {
+        return this.createVariable(ObjectVariable, ctx, object, customStringRepr);
+      }
     }
 
     return this.createVariable(Variable, ctx, object);
   }
 
   /**
+   * Ensures symbols for custom descriptions are available, must be used
+   * before getStringProps/getToStringIfCustom
+   */
+  public async getDescriptionSymbols(objectId: string): Promise<Cdp.Runtime.CallArgument> {
+    this.settings.descriptionSymbols ??= getDescriptionSymbols({
+      cdp: this.cdp,
+      args: [],
+      objectId,
+    }).then(
+      r => ({ objectId: r.objectId }),
+      () => ({ value: [] }),
+    );
+
+    return await this.settings.descriptionSymbols;
+  }
+
+  /**
    * Creates Variables for each property on the RemoteObject.
    */
-  public async createObjectPropertyVars(object: Cdp.Runtime.RemoteObject): Promise<Variable[]> {
+  public async createObjectPropertyVars(
+    object: Cdp.Runtime.RemoteObject,
+    evaluationOptions?: Dap.EvaluationOptions,
+  ): Promise<Variable[]> {
     const properties: (Promise<Variable[]> | Variable[])[] = [];
 
     if (this.settings.customPropertiesGenerator) {
       const { result, errorDescription } = await this.evaluateCodeForObject(
         object,
-        [],
         this.settings.customPropertiesGenerator,
         [],
-        /*catchAndReturnErrors*/ false,
       );
 
       if (result && result.type !== 'undefined') {
@@ -260,7 +321,7 @@ class VariableContext {
             ErrorVariable,
             { name: '', sortOrder: SortOrder.Error },
             result as Cdp.Runtime.RemoteObject,
-            result?.description || errorDescription || localize('error.unknown', 'Unknown error'),
+            result?.description || errorDescription || l10n.t('Unknown error'),
           ),
         ]);
       }
@@ -268,6 +329,13 @@ class VariableContext {
 
     if (!object.objectId) {
       return [];
+    }
+
+    if (evaluationOptions) {
+      this.cdp.DotnetDebugger.setEvaluationOptions({
+        options: evaluationOptions,
+        type: 'variable',
+      });
     }
 
     const [accessorsProperties, ownProperties, stringyProps] = await Promise.all([
@@ -282,14 +350,17 @@ class VariableContext {
         ownProperties: true,
         generatePreview: true,
       }),
-      getStringyProps({
-        cdp: this.cdp,
-        args: [64],
+      this.cdp.Runtime.callFunctionOn({
+        functionDeclaration: getStringyProps.decl(
+          `${customStringReprMaxLength}`,
+          this.settings.customDescriptionGenerator || 'null',
+        ),
+        arguments: [await this.getDescriptionSymbols(object.objectId)],
         objectId: object.objectId,
         throwOnSideEffect: true,
         returnByValue: true,
       })
-        .then(r => r?.value || {})
+        .then(r => r?.result.value || {})
         .catch(() => ({} as Record<string, string>)),
     ]);
     if (!accessorsProperties || !ownProperties) return [];
@@ -305,8 +376,8 @@ class VariableContext {
 
       // Handle updated prototype representation in recent V8 (vscode#130365)
       if (
-        property.name === '__proto__' &&
-        ownProperties.internalProperties?.some(p => p.name === '[[Prototype]]')
+        property.name === '__proto__'
+        && ownProperties.internalProperties?.some(p => p.name === '[[Prototype]]')
       ) {
         continue;
       }
@@ -318,9 +389,6 @@ class VariableContext {
       if (property.symbol) propertySymbols.push(property);
       else propertiesMap.set(property.name, property);
     }
-    for (const property of ownProperties.privateProperties ?? []) {
-      propertiesMap.set(property.name, property);
-    }
 
     // Push own properties & accessors and symbols
     for (const propertiesCollection of [propertiesMap.values(), propertySymbols.values()]) {
@@ -329,10 +397,21 @@ class VariableContext {
           this.createPropertyVar(
             p,
             object,
-            stringyProps?.hasOwnProperty(p.name) ? stringyProps[p.name] : undefined,
+            stringyProps?.hasOwnProperty(p.name)
+              ? localizeIndescribable(stringyProps[p.name])
+              : undefined,
           ),
         );
       }
+    }
+
+    for (const property of ownProperties.privateProperties ?? []) {
+      properties.push(
+        this.createPropertyVar(property, object, undefined, {
+          presentationHint: { visibility: 'private' },
+          sortOrder: SortOrder.Private,
+        }),
+      );
     }
 
     // Push internal properties
@@ -343,9 +422,9 @@ class VariableContext {
 
       let variable: Variable | undefined;
       if (
-        p.name === '[[FunctionLocation]]' &&
-        p.value &&
-        (p.value.subtype as string) === 'internal#location'
+        p.name === '[[FunctionLocation]]'
+        && p.value
+        && (p.value.subtype as string) === 'internal#location'
       ) {
         variable = this.createVariable(
           FunctionLocationVariable,
@@ -375,69 +454,38 @@ class VariableContext {
     return flatten(await Promise.all(properties));
   }
 
-  /**
-   * Gets a description for the RemoteObject, using the customDescriptionGenerator
-   * if one is provided by the consumer.
-   */
-  public async getCustomObjectDescription(
-    name: string,
-    object: Cdp.Runtime.RemoteObject,
-    previewContext: PreviewContextType,
-  ): Promise<string> {
-    const defaultValueDescription =
-      (name === '__proto__' && object.description) ||
-      objectPreview.previewRemoteObject(object, previewContext);
-
-    if (!this.settings.customDescriptionGenerator) {
-      return defaultValueDescription;
-    }
-
-    const { result, errorDescription } = await this.evaluateCodeForObject(
-      object,
-      ['defaultValue'],
-      this.settings.customDescriptionGenerator,
-      [defaultValueDescription],
-      /*catchAndReturnErrors*/ true,
-    );
-
-    return result?.value !== undefined
-      ? String(result.value)
-      : localize(
-          'error.customValueDescriptionGeneratorFailed',
-          "{0} (couldn't describe: {1})",
-          defaultValueDescription,
-          errorDescription,
-        );
-  }
-
   private async createPropertyVar(
     p: AnyPropertyDescriptor,
     owner: Cdp.Runtime.RemoteObject,
     customStringRepr: string | undefined,
+    contextInit?: Partial<IContextInit>,
   ): Promise<Variable[]> {
     const result: Variable[] = [];
+    const hasGetter = p.get && p.get.type !== 'undefined';
+    const hasSetter = p.set && p.set.type !== 'undefined';
+
     const ctx: Required<IContextInit> = {
       name: p.name,
       presentationHint: {},
       sortOrder: SortOrder.Default,
+      ...contextInit,
     };
 
-    const hasGetter = p.get && p.get.type !== 'undefined';
-    const hasSetter = p.set && p.set.type !== 'undefined';
-
-    if (isPublicDescriptor(p)) {
-      // sort non-enumerable properties as private, except for getters, which
-      // are automatically non-enumerable but not (automatically) considered private (#1215)
-      if (p.enumerable === false && !hasGetter) {
-        ctx.presentationHint.visibility = 'internal';
+    if (!contextInit) {
+      if (isPublicDescriptor(p)) {
+        // sort non-enumerable properties as private, except for getters, which
+        // are automatically non-enumerable but not (automatically) considered private (#1215)
+        if (p.enumerable === false && !hasGetter) {
+          ctx.presentationHint.visibility = 'internal';
+          ctx.sortOrder = SortOrder.Private;
+        }
+        if (p.writable === false || (hasGetter && !hasSetter)) {
+          ctx.presentationHint.attributes = ['readOnly'];
+        }
+      } else {
+        ctx.presentationHint.visibility = 'private';
         ctx.sortOrder = SortOrder.Private;
       }
-      if (p.writable === false || (hasGetter && !hasSetter)) {
-        ctx.presentationHint.attributes = ['readOnly'];
-      }
-    } else {
-      ctx.presentationHint.visibility = 'private';
-      ctx.sortOrder = SortOrder.Private;
     }
 
     // If the value is simply present, add that
@@ -451,7 +499,9 @@ class VariableContext {
         this.createVariable(GetterVariable, ctx, p.get as Cdp.Runtime.RemoteObject, owner),
       );
     } else if (hasSetter) {
-      result.push(this.createVariable(SetterOnlyVariable, ctx, p.set as Cdp.Runtime.RemoteObject));
+      result.push(
+        this.createVariable(SetterOnlyVariable, ctx, p.set as Cdp.Runtime.RemoteObject),
+      );
     }
 
     return result;
@@ -459,19 +509,13 @@ class VariableContext {
 
   private async evaluateCodeForObject(
     object: Cdp.Runtime.RemoteObject,
-    parameterNames: string[],
-    codeToEvaluate: string,
+    functionDeclaration: string,
     argumentsToEvaluateWith: string[],
-    catchAndReturnErrors: boolean,
   ): Promise<{ result?: Cdp.Runtime.RemoteObject; errorDescription?: string }> {
     try {
       const customValueDescription = await this.cdp.Runtime.callFunctionOn({
         objectId: object.objectId,
-        functionDeclaration: extractFunctionFromCustomDescriptionGenerator(
-          parameterNames,
-          codeToEvaluate,
-          catchAndReturnErrors,
-        ),
+        functionDeclaration,
         arguments: argumentsToEvaluateWith.map(toCallArgument),
       });
 
@@ -482,12 +526,14 @@ class VariableContext {
           return { errorDescription: customValueDescription.result.description };
         }
       }
-      return { errorDescription: localize('error.unknown', 'Unknown error') };
+      return { errorDescription: l10n.t('Unknown error') };
     } catch (e) {
       return { errorDescription: e.stack || e.message || String(e) };
     }
   }
 }
+
+const isNumberOrNumeric = (s: string | number) => typeof s === 'number' || /^[0-9]+$/.test(s);
 
 class Variable implements IVariable {
   public id = getVariableId();
@@ -504,7 +550,7 @@ class Variable implements IVariable {
 
   constructor(
     protected readonly context: VariableContext,
-    protected readonly remoteObject: Cdp.Runtime.RemoteObject,
+    public readonly remoteObject: Cdp.Runtime.RemoteObject,
   ) {}
 
   /**
@@ -512,15 +558,27 @@ class Variable implements IVariable {
    */
   public get accessor(): string {
     const { parent, name } = this.context;
-    if (!parent || parent instanceof Scope) {
-      return this.context.name;
-    }
-
     if (parent instanceof AccessorVariable) {
       return parent.accessor;
     }
 
-    if (typeof name === 'number' || /^[0-9]+$/.test(name)) {
+    if (!(parent instanceof Variable)) {
+      return this.context.name;
+    }
+
+    // Maps and sets:
+    const grandparent = parent.context.parent;
+    if (grandparent instanceof Variable) {
+      if ((this.remoteObject.subtype as string) === 'internal#entry') {
+        return `[...${grandparent.accessor}.entries()][${+name}]`;
+      }
+
+      if ((parent.remoteObject.subtype as string) === 'internal#entry') {
+        return `${parent.accessor}[${this.name === 'key' ? 0 : 1}]`;
+      }
+    }
+
+    if (isNumberOrNumeric(name)) {
       return `${parent.accessor}[${name}]`;
     }
 
@@ -567,11 +625,7 @@ class Variable implements IVariable {
     });
 
     if (!result) {
-      throw new ProtocolError(
-        errors.createSilentError(
-          localize('error.setVariableDidFail', 'Unable to set variable value'),
-        ),
-      );
+      throw new ProtocolError(errors.createSilentError(l10n.t('Unable to set variable value')));
     }
 
     if (result.exceptionDetails) {
@@ -610,8 +664,9 @@ class OutputVariable extends Variable {
     return Promise.resolve({
       name: this.context.name,
       value: this.value,
-      variablesReference:
-        this.stackTrace || this.args.some(objectPreview.previewAsObject) ? this.id : 0,
+      variablesReference: this.stackTrace || this.args.some(objectPreview.previewAsObject)
+        ? this.id
+        : 0,
     });
   }
 
@@ -658,7 +713,7 @@ class StacktraceOutputVariable extends Variable {
 }
 
 class FunctionLocationVariable extends Variable {
-  private readonly location: Cdp.Debugger.Location;
+  public readonly location: Cdp.Debugger.Location;
 
   constructor(context: VariableContext, remoteObject: Cdp.Runtime.RemoteObject) {
     super(context, remoteObject);
@@ -738,16 +793,22 @@ class ObjectVariable extends Variable implements IMemoryReadable {
     }
 
     // for the first level of evaluations, toString it on-demand
-    if (!this.context.parent && this.customStringRepr !== NoCustomStringRepr) {
+    if (
+      !this.context.parent
+      && this.remoteObject.objectId
+      && this.customStringRepr !== NoCustomStringRepr
+    ) {
       try {
-        const result = await getToStringIfCustom({
-          cdp: this.context.cdp,
-          args: [64],
+        const ret = await this.context.cdp.Runtime.callFunctionOn({
+          functionDeclaration: getToStringIfCustom.decl(
+            `${customStringReprMaxLength}`,
+            this.context.customDescriptionGenerator || 'null',
+          ),
           objectId: this.remoteObject.objectId,
           returnByValue: true,
         });
-        if (result.value) {
-          return (this.customStringRepr = result.value);
+        if (ret?.result.value) {
+          return (this.customStringRepr = localizeIndescribable(ret.result.value));
         }
       } catch (e) {
         this.customStringRepr = NoCustomStringRepr;
@@ -755,10 +816,9 @@ class ObjectVariable extends Variable implements IMemoryReadable {
       }
     }
 
-    return await this.context.getCustomObjectDescription(
-      this.context.name,
-      this.remoteObject,
-      previewContext,
+    return (
+      (this.context.name === '__proto__' && this.remoteObject.description)
+      || objectPreview.previewRemoteObject(this.remoteObject, previewContext)
     );
   }
 
@@ -786,8 +846,62 @@ class ObjectVariable extends Variable implements IMemoryReadable {
     return result.value;
   }
 
-  public override getChildren(_params: Dap.VariablesParams) {
-    return this.context.createObjectPropertyVars(this.remoteObject);
+  public override getChildren(_params: Dap.VariablesParamsExtended) {
+    return this.context.createObjectPropertyVars(this.remoteObject, _params.evaluationOptions);
+  }
+}
+
+class FunctionVariable extends ObjectVariable {
+  private readonly baseChildren = once(() => super.getChildren({ variablesReference: this.id }));
+
+  public override async toDap(previewContext: PreviewContextType): Promise<Dap.Variable> {
+    const [dap, children] = await Promise.all([
+      super.toDap(previewContext),
+      this.baseChildren(),
+    ]);
+
+    if (children.some(c => c instanceof FunctionLocationVariable)) {
+      dap.valueLocationReference = this.id;
+    }
+
+    return dap;
+  }
+}
+
+const entriesVariableName = '[[Entries]]';
+
+class SetOrMapVariable extends ObjectVariable {
+  private readonly size?: number;
+  public readonly isMap: boolean;
+  private readonly baseChildren = once(() => super.getChildren({ variablesReference: this.id }));
+
+  constructor(context: VariableContext, remoteObject: Cdp.Runtime.RemoteObject) {
+    super(context, remoteObject, NoCustomStringRepr);
+    this.isMap = remoteObject.subtype === 'map';
+    const cast = remoteObject.preview as MapPreview | SetPreview | undefined;
+    this.size = Number(cast?.properties.find(p => p.name === 'size')?.value) ?? undefined;
+  }
+
+  public override async toDap(previewContext: PreviewContextType): Promise<Dap.Variable> {
+    const dap = await super.toDap(previewContext);
+    if (this.size && this.size > 100) {
+      dap.indexedVariables = this.size;
+    }
+
+    return dap;
+  }
+
+  public override async getChildren(params: Dap.VariablesParams): Promise<Variable[]> {
+    const baseChildren = await this.baseChildren();
+    const entryChildren = await baseChildren
+      .find(c => c.name === entriesVariableName)
+      ?.getChildren(params);
+
+    return [
+      // filter to only show the actualy entries, not the array prototype/length
+      ...(entryChildren || []).filter(v => v.sortOrder === SortOrder.Default),
+      ...baseChildren.filter(c => c.name !== entriesVariableName),
+    ];
   }
 }
 
@@ -918,7 +1032,9 @@ class GetterVariable extends AccessorVariable {
       const result = await invokeGetter({
         cdp: this.context.cdp,
         objectId: this.parentObject.objectId,
-        args: [this.context.name],
+        // object ID is always set for functions:
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        args: [new RemoteObjectId(this.remoteObject.objectId!)],
       });
 
       return [
@@ -937,6 +1053,131 @@ class GetterVariable extends AccessorVariable {
   }
 }
 
+class WasmVariable implements IVariable, IMemoryReadable {
+  public static presentationHint: Dap.VariablePresentationHint = {
+    attributes: ['readOnly'],
+  };
+
+  /** @inheritdoc */
+  public readonly id = getVariableId();
+
+  /** @inheritdoc */
+  public readonly sortOrder = 0;
+
+  constructor(
+    private readonly context: VariableContext,
+    private readonly variable: IWasmVariableEvaluation,
+    private readonly scopeRef: IScopeRef,
+  ) {}
+
+  public toDap(): Promise<Dap.Variable> {
+    return Promise.resolve({
+      name: this.context.name,
+      value: this.variable.description || '',
+      variablesReference: this.variable.getChildren ? this.id : 0,
+      memoryReference: this.variable.linearMemoryAddress ? String(this.id) : undefined,
+      presentationHint: this.context.presentationHint,
+    });
+  }
+
+  public async getChildren(): Promise<IVariable[]> {
+    const children = (await this.variable.getChildren?.()) || [];
+    return children.map(c =>
+      this.context.createVariable(
+        WasmVariable,
+        { name: c.name, presentationHint: WasmVariable.presentationHint },
+        c.value,
+        this.scopeRef,
+      )
+    );
+  }
+
+  /** @inheritdoc */
+  public async readMemory(offset: number, count: number): Promise<Buffer | undefined> {
+    const addr = this.variable.linearMemoryAddress;
+    if (addr === undefined) {
+      return undefined;
+    }
+
+    const result = await this.context.cdp.Debugger.evaluateOnCallFrame({
+      callFrameId: this.scopeRef.callFrameId,
+      expression: `(${readMemory.source}).call(memories[0].buffer, ${
+        +addr + offset
+      }, ${+count}) ${getSourceSuffix()}`,
+      returnByValue: true,
+    });
+
+    if (!result) {
+      throw new RemoteException({
+        exceptionId: 0,
+        text: 'No response from CDP',
+        lineNumber: 0,
+        columnNumber: 0,
+      });
+    }
+
+    return Buffer.from(result.result.value, 'hex');
+  }
+
+  /** @inheritdoc */
+  public async writeMemory(offset: number, memory: Buffer): Promise<number> {
+    const addr = this.variable.linearMemoryAddress;
+    if (addr === undefined) {
+      return 0;
+    }
+
+    const result = await this.context.cdp.Debugger.evaluateOnCallFrame({
+      callFrameId: this.scopeRef.callFrameId,
+      expression: `(${writeMemory.source}).call(memories[0].buffer, ${+addr + offset}, ${
+        JSON.stringify(memory.toString('hex'))
+      }) ${getSourceSuffix()}`,
+      returnByValue: true,
+    });
+
+    return result?.result.value || 0;
+  }
+}
+
+class WasmScopeVariable implements IVariable {
+  /** @inheritdoc */
+  public readonly id = getVariableId();
+
+  /** @inheritdoc */
+  public readonly sortOrder = wasmScopeNames[this.kind]?.sortOrder || 0;
+
+  constructor(
+    private readonly context: VariableContext,
+    public readonly kind: WasmScope,
+    private readonly variables: readonly IWasmVariable[],
+    private readonly scopeRef: IScopeRef,
+  ) {}
+
+  toDap(): Promise<Dap.Variable> {
+    return Promise.resolve({
+      name: wasmScopeNames[this.kind]?.name || this.kind,
+      value: '',
+      variablesReference: this.id,
+    });
+  }
+
+  getChildren(): Promise<IVariable[]> {
+    return Promise.all(
+      this.variables.map(async v => {
+        const evaluated = await v.evaluate();
+        return this.context.createVariable(
+          WasmVariable,
+          {
+            name: v.name,
+            presentationHint: WasmVariable.presentationHint,
+          },
+          evaluated,
+          this.scopeRef,
+        );
+      }),
+    );
+  }
+}
+
 class Scope implements IVariableContainer {
   /** @inheritdoc */
   public readonly id = getVariableId();
@@ -949,7 +1190,7 @@ class Scope implements IVariableContainer {
     private readonly renameProvider: IRenameProvider,
   ) {}
 
-  public async getChildren(_params: Dap.VariablesParams): Promise<Variable[]> {
+  public async getChildren(_params: Dap.VariablesParams): Promise<IVariable[]> {
     const variables = await this.context.createObjectPropertyVars(this.remoteObject);
     const existing = new Set(variables.map(v => v.name));
     for (const extraProperty of this.extraProperties) {
@@ -966,7 +1207,8 @@ class Scope implements IVariableContainer {
   /** Maps any rename for the identifier in the current scope. */
   public async getRename(forIdentifier: string) {
     const renames = await this.renameProvider.provideOnStackframe(this.ref.stackFrame);
-    return renames.getOriginalName(forIdentifier, this.ref.stackFrame.rawPosition) || forIdentifier;
+    return renames.getOriginalName(forIdentifier, this.ref.stackFrame.rawPosition)
+      || forIdentifier;
   }
 
   /** Sets a property of the scope */
@@ -976,9 +1218,7 @@ class Scope implements IVariableContainer {
       callFrameId: this.ref.callFrameId,
     });
     if (!evaluated) {
-      throw new ProtocolError(
-        errors.createUserError(localize('error.invalidExpression', 'Invalid expression')),
-      );
+      throw new ProtocolError(errors.createUserError(l10n.t('Invalid expression')));
     }
     if (evaluated.exceptionDetails) {
       throw new ProtocolError(errorFromException(evaluated.exceptionDetails));
@@ -1025,6 +1265,7 @@ class VariablesMap {
 @injectable()
 export class VariableStore {
   private vars = new VariablesMap();
+  private readonly contextSettings: IContextSettings;
 
   constructor(
     @inject(IRenameProvider) private readonly renameProvider: IRenameProvider,
@@ -1032,7 +1273,18 @@ export class VariableStore {
     @inject(IDapApi) private readonly dap: Dap.Api,
     @inject(AnyLaunchConfiguration) private readonly launchConfig: AnyLaunchConfiguration,
     private readonly locationProvider: IVariableStoreLocationProvider,
-  ) {}
+  ) {
+    this.contextSettings = {
+      customDescriptionGenerator: launchConfig.customDescriptionGenerator
+        && extractFunctionFromCustomGenerator(
+          ['defaultValue'],
+          launchConfig.customDescriptionGenerator,
+          false,
+        ),
+      customPropertiesGenerator: launchConfig.customPropertiesGenerator
+        && extractFunctionFromCustomGenerator([], launchConfig.customPropertiesGenerator, false),
+    };
+  }
 
   /** Creates a new VariableStore using the current DAP, CDP, and configurations. */
   public createDetached() {
@@ -1051,9 +1303,9 @@ export class VariableStore {
   }
 
   /** Creates a variable not attached to any specific scope. */
-  public createFloatingVariable(value: Cdp.Runtime.RemoteObject): IVariable {
+  public createFloatingVariable(expression: string, value: Cdp.Runtime.RemoteObject): IVariable {
     const ctx = this.createFloatingContext();
-    return ctx.createVariableByType({ name: '' }, value);
+    return ctx.createVariableByType({ name: expression }, value);
   }
 
   /**
@@ -1066,12 +1318,11 @@ export class VariableStore {
     outputType?: Cdp.Runtime.ConsoleAPICalledEvent['type'],
   ): IVariableContainer {
     const ctx = this.createFloatingContext();
-    const output =
-      args.length === 1 && outputType === 'table'
-        ? ctx.createVariable(OutputTableVariable, { name: '' }, args[0])
-        : args.length === 1 && objectPreview.previewAsObject(args[0]) && !stackTrace
-        ? ctx.createVariableByType({ name: '' }, args[0])
-        : ctx.createVariable(OutputVariable, { name: '' }, text, args, stackTrace);
+    const output = args.length === 1 && outputType === 'table'
+      ? ctx.createVariable(OutputTableVariable, { name: '' }, args[0])
+      : args.length === 1 && objectPreview.previewAsObject(args[0]) && !stackTrace
+      ? ctx.createVariableByType({ name: '' }, args[0])
+      : ctx.createVariable(OutputVariable, { name: '' }, text, args, stackTrace);
     const container = new OutputVariableContainer(output);
     this.vars.add(container);
 
@@ -1093,14 +1344,37 @@ export class VariableStore {
         this.vars,
         this.locationProvider,
         () => scope,
-        {
-          customDescriptionGenerator: this.launchConfig.customDescriptionGenerator,
-          customPropertiesGenerator: this.launchConfig.customPropertiesGenerator,
-        },
+        this.contextSettings,
       ),
       scopeRef,
       extraProperties,
       this.renameProvider,
+    );
+
+    this.vars.add(scope);
+
+    return scope;
+  }
+
+  /** Creates a container for a CDP Scope */
+  public createWasmScope(
+    kind: WasmScope,
+    variables: readonly IWasmVariable[],
+    scopeRef: IScopeRef,
+  ): IVariable {
+    const scope: WasmScopeVariable = new WasmScopeVariable(
+      new VariableContext(
+        this.cdp,
+        undefined,
+        { name: '' },
+        this.vars,
+        this.locationProvider,
+        () => scope,
+        this.contextSettings,
+      ),
+      kind,
+      variables,
+      scopeRef,
     );
 
     this.vars.add(scope);
@@ -1135,6 +1409,22 @@ export class VariableStore {
     return written;
   }
 
+  /**
+   * Gets variable names from a known {@link IVariableContainer}. An optimized
+   * version of `getVariables` that saves work generating previews.
+   */
+  public async getVariableNames(
+    params: Dap.VariablesParams,
+  ): Promise<{ name: string; remoteObject: Cdp.Runtime.RemoteObject }[]> {
+    const container = this.vars.get(params.variablesReference);
+    if (!container) {
+      return [];
+    }
+
+    const children = await container.getChildren(params);
+    return children.filter(isInstanceOf(Variable));
+  }
+
   /** Gets variables from a known {@link IVariableContainer} */
   public async getVariables(params: Dap.VariablesParams): Promise<Dap.Variable[]> {
     const container = this.vars.get(params.variablesReference);
@@ -1152,18 +1442,34 @@ export class VariableStore {
               : PreviewContextType.PropertyValue,
             params.format,
           )
-          .then(dap => ({ v, dap })),
+          .then(dap => ({ v, dap }))
       ),
     );
 
     return daps
       .sort(
         (a, b) =>
-          a.v.sortOrder - b.v.sortOrder ||
-          +a.dap.name - +b.dap.name ||
-          a.dap.name.localeCompare(b.dap.name),
+          a.v.sortOrder - b.v.sortOrder
+          || +a.dap.name - +b.dap.name
+          || a.dap.name.localeCompare(b.dap.name),
       )
       .map(v => v.dap);
+  }
+
+  public async getLocations(variablesReference: number): Promise<Cdp.Debugger.Location> {
+    const container = this.vars.get(variablesReference);
+    if (!container) {
+      throw errors.locationNotFound();
+    }
+
+    // note: is actually free because the container will have cached its children
+    const children = await container.getChildren({ variablesReference });
+    const locationVar = children.find(isInstanceOf(FunctionLocationVariable));
+    if (!locationVar) {
+      throw errors.locationNotFound();
+    }
+
+    return locationVar.location;
   }
 
   /** Sets a variable */
@@ -1171,18 +1477,14 @@ export class VariableStore {
     const container = this.vars.get(params.variablesReference);
 
     if (!params.value) {
-      throw new ProtocolError(
-        errors.createUserError(localize('error.emptyExpression', 'Cannot set an empty value')),
-      );
+      throw new ProtocolError(errors.createUserError(l10n.t('Cannot set an empty value')));
     }
 
     if (container instanceof Scope || container instanceof Variable) {
       const newVar = await container.setProperty(params.name, params.value);
       return await newVar.toDap(PreviewContextType.PropertyValue, params.format);
     } else {
-      throw new ProtocolError(
-        errors.createSilentError(localize('error.variableNotFound', 'Variable not found')),
-      );
+      throw new ProtocolError(errors.createSilentError(l10n.t('Variable not found')));
     }
   }
 
@@ -1194,16 +1496,13 @@ export class VariableStore {
       this.vars,
       this.locationProvider,
       undefined,
-      {
-        customDescriptionGenerator: this.launchConfig.customDescriptionGenerator,
-        customPropertiesGenerator: this.launchConfig.customPropertiesGenerator,
-      },
+      this.contextSettings,
     );
   }
 }
 
 function errorFromException(details: Cdp.Runtime.ExceptionDetails): Dap.Error {
-  const message =
-    (details.exception && objectPreview.previewException(details.exception).title) || details.text;
+  const message = (details.exception && objectPreview.previewException(details.exception).title)
+    || details.text;
   return errors.createUserError(message);
 }

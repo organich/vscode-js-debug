@@ -2,19 +2,22 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import { injectable, inject } from 'inversify';
+import * as l10n from '@vscode/l10n';
+import { randomBytes } from 'crypto';
+import { inject, injectable } from 'inversify';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import Cdp from '../cdp/api';
 import { ICdpApi } from '../cdp/connection';
 import Dap from '../dap/api';
-import { IProfilerFactory, IProfile } from './profiling';
 import { invalidConcurrentProfile } from '../dap/errors';
 import { ProtocolError } from '../dap/protocolError';
-import { Thread } from './threads';
-import { BreakpointManager, BreakpointEnableFilter } from './breakpoints';
+import { IShutdownParticipants, ShutdownOrder } from '../ui/shutdownParticipants';
+import { BreakpointEnableFilter, BreakpointManager } from './breakpoints';
 import { UserDefinedBreakpoint } from './breakpoints/userDefinedBreakpoint';
-import { join } from 'path';
-import { tmpdir } from 'os';
-import { randomBytes } from 'crypto';
+import { getDefaultProfileName, IProfile, IProfilerFactory } from './profiling';
+import { BasicCpuProfiler } from './profiling/basicCpuProfiler';
+import { Thread } from './threads';
 
 /**
  * Provides profiling functionality for the debug adapter.
@@ -36,11 +39,14 @@ interface IRunningProfile {
 @injectable()
 export class ProfileController implements IProfileController {
   private profile?: Promise<IRunningProfile>;
+  private seenConsoleProfileNames = Object.create(null);
 
   constructor(
     @inject(ICdpApi) private readonly cdp: Cdp.Api,
     @inject(IProfilerFactory) private readonly factory: IProfilerFactory,
+    @inject(BasicCpuProfiler) private readonly basicCpuProfiler: BasicCpuProfiler,
     @inject(BreakpointManager) private readonly breakpoints: BreakpointManager,
+    @inject(IShutdownParticipants) private readonly shutdown: IShutdownParticipants,
   ) {}
 
   /**
@@ -53,6 +59,24 @@ export class ProfileController implements IProfileController {
     });
 
     dap.on('stopProfile', () => this.stopProfiling(dap));
+
+    this.cdp.Profiler.on('consoleProfileStarted', () => {
+      dap.output({
+        output: l10n.t('Console profile started') + '\n',
+        category: 'console',
+      });
+    });
+
+    this.cdp.Profiler.on('consoleProfileFinished', async evt => {
+      const promise = this.saveConsoleProfile(dap, evt);
+      const shutdownBlocker = this.shutdown.register(
+        ShutdownOrder.ExecutionContexts,
+        () => promise,
+      );
+      await promise;
+      shutdownBlocker.dispose();
+    });
+
     thread.onPaused(() => this.stopProfiling(dap));
   }
 
@@ -70,6 +94,28 @@ export class ProfileController implements IProfileController {
     });
 
     await this.profile;
+  }
+
+  private async saveConsoleProfile(dap: Dap.Api, evt: Cdp.Profiler.ConsoleProfileFinishedEvent) {
+    let basename: string;
+    if (evt.title) {
+      basename = evt.title.replace(/[\/\\]/g, '-');
+      const nth = this.seenConsoleProfileNames[evt.title] || 0;
+      this.seenConsoleProfileNames[evt.title] = nth + 1;
+      if (nth > 0) {
+        basename += `-${nth}`;
+      }
+    } else {
+      basename = getDefaultProfileName();
+    }
+
+    basename += BasicCpuProfiler.extension;
+    await this.basicCpuProfiler.save(evt.profile, basename);
+
+    dap.output({
+      output: l10n.t('CPU profile saved as "{0}" in your workspace folder', basename) + '\n',
+      category: 'console',
+    });
   }
 
   private async startProfileInner(dap: Dap.Api, thread: Thread, params: Dap.StartProfileParams) {

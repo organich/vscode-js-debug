@@ -35,9 +35,9 @@ export class RemoteBrowserLauncher extends BrowserLauncher<AnyChromiumLaunchConf
    * @inheritdoc
    */
   protected resolveParams(params: AnyLaunchConfiguration) {
-    return (params.type === DebugType.Chrome || params.type === DebugType.Edge) &&
-      params.request === 'launch' &&
-      params.browserLaunchLocation === 'ui'
+    return (params.type === DebugType.Chrome || params.type === DebugType.Edge)
+        && params.request === 'launch'
+        && params.browserLaunchLocation === 'ui'
       ? params
       : undefined;
   }
@@ -63,7 +63,9 @@ export class RemoteBrowserLauncher extends BrowserLauncher<AnyChromiumLaunchConf
     });
 
     return {
-      cdp: new Connection(transport, this.logger, telemetryReporter),
+      canReconnect: false,
+      createConnection: () =>
+        Promise.resolve(new Connection(transport, this.logger, telemetryReporter)),
       process: {
         onExit: new EventEmitter<number>().event,
         onError: new EventEmitter<Error>().event,

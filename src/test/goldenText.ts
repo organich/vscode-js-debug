@@ -29,47 +29,11 @@ export class GoldenText {
   _hasNonAssertedLogs: boolean;
   _workspaceFolder: string;
 
-  constructor(testName: string, workspaceFolder: string) {
+  constructor(testName: string, private readonly testFile: string, workspaceFolder: string) {
     this._results = [];
     this._testName = testName;
     this._hasNonAssertedLogs = false;
     this._workspaceFolder = urlUtils.platformPathToPreferredCase(workspaceFolder);
-  }
-
-  _getLocation() {
-    const stack = new Error().stack;
-    if (!stack) return null;
-    const stackFrames = stack.split('\n').slice(1);
-    // Find first stackframe that doesn't point to this file.
-    for (let frame of stackFrames) {
-      frame = frame.trim();
-      if (!frame.startsWith('at ')) return null;
-      if (frame.endsWith(')')) {
-        const from = frame.indexOf('(');
-        frame = frame.substring(from + 1, frame.length - 1);
-      } else {
-        frame = frame.substring('at '.length);
-      }
-
-      const match = frame.match(/^(.*):(\d+):(\d+)$/);
-      if (!match) return null;
-      const filePath = match[1];
-
-      // We need to consider .ts files because we may have source-map-support to convert stack traces to .ts
-
-      if (
-        filePath === __filename ||
-        filePath === __filename.replace(/[\\/]out([\\/].*).js$/, '$1.ts')
-      )
-        continue;
-
-      if (filePath.endsWith('.ts')) {
-        return filePath.replace(/([\\/]src[\\/].*).ts$/, `${path.sep}out$1.js`);
-      } else {
-        return filePath;
-      }
-    }
-    return null;
   }
 
   hasNonAssertedLogs() {
@@ -126,7 +90,7 @@ export class GoldenText {
   }
 
   private findGoldenFilePath() {
-    const testFilePath = this._getLocation();
+    const testFilePath = this.testFile;
     if (!testFilePath) {
       throw new Error('GoldenText failed to get filename!');
     }
@@ -137,17 +101,7 @@ export class GoldenText {
       .replace(/\s/g, '-')
       .replace(/[^-0-9a-zа-яё]/gi, '');
 
-    const testFileBase = path.resolve(
-      __dirname,
-      '..',
-      '..',
-      '..',
-      'src',
-      'test',
-      path.relative(__dirname, path.dirname(testFilePath)),
-      fileFriendlyTestName,
-    );
-
+    const testFileBase = path.resolve(path.dirname(testFilePath), fileFriendlyTestName);
     const platformPath = testFileBase + `.${process.platform}.txt`;
     if (fs.existsSync(platformPath)) {
       return platformPath;
@@ -166,11 +120,15 @@ export class GoldenText {
 
       // Replace it with the ${replacementString} and a forward-slashed version
       // of the rest of the line.
-      value = value.replace(re, (_match, trailing) => replacement + forceForwardSlashes(trailing));
+      value = value.replace(
+        re,
+        (_match, trailing) => replacement + forceForwardSlashes(trailing),
+      );
     };
 
     value = String(value);
     replacePath(this._workspaceFolder, '${workspaceFolder}');
+    replacePath(this._workspaceFolder.replace(/\\/g, '\\\\'), '${workspaceFolder}'); // string escaping on windows
     replacePath(testFixturesDir, '${fixturesDir}');
     value = value.replace(/testWorkspace/g, '${workspaceFolder}');
     value = value.replace('/private${fixturesDir}', '${fixturesDir}'); // for osx
@@ -184,6 +142,7 @@ export class GoldenText {
 
     return value
       .replace(/VM\d+/g, 'VM<xx>')
+      .replace(/logpoint-.*?\.cdp/g, 'logpoint-<hash>.cdp')
       .replace(/\r\n/g, '\n')
       .replace(/@\ .*vscode-pwa(\/|\\)/g, '@ ')
       .replace(/data:text\/html;base64,[a-zA-Z0-9+/]*=?/g, '<data-url>');
@@ -231,8 +190,9 @@ export class GoldenText {
       prefix = prefix || '';
       firstLinePrefix = firstLinePrefix || prefix;
       lines.push(firstLinePrefix + '[');
-      for (let i = 0; i < object.length; ++i)
+      for (let i = 0; i < object.length; ++i) {
         dumpValue(object[i], '    ' + prefix, '    ' + prefix + '[' + i + '] : ');
+      }
       lines.push(prefix + ']');
     }
 

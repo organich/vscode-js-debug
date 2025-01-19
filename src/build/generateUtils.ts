@@ -2,24 +2,17 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
-import { format, Options as PrettierOptions } from 'prettier';
-import * as path from 'path';
 import { promises as fs } from 'fs';
-import { prettier as defaultPrettierOpts } from '../../package.json';
+import * as path from 'path';
 
 export function writeCodeToFile(
   code: string,
   relativeFilePath: string,
-  prettierOpts: PrettierOptions = {},
 ) {
-  const fileName = path.join(__dirname, '..', '..', '..', relativeFilePath);
+  const fileName = path.join(__dirname, '..', '..', relativeFilePath);
   return fs.writeFile(
     fileName,
-    format(code, {
-      parser: 'typescript',
-      ...defaultPrettierOpts,
-      ...prettierOpts,
-    }),
+    code,
     { encoding: 'utf-8' },
   );
 }
